@@ -1138,12 +1138,6 @@ static void putOpaque(SFLReceiver *receiver, char *val, int len)
     receiver->sampleCollector.datap += ((len+3)/4);
 }
 
-static uint32_t memcacheOpEncodingLength(SFLSampled_memcache *mcop) {
-    uint32_t elemSiz = stringEncodingLength(&mcop->key);
-    elemSiz += 24; /* protocol, cmd, nkeys, value_bytes, duration_uS, status */
-    return elemSiz;
-}
-
 static uint32_t httpOpEncodingLength(SFLSampled_http *op) {
   uint32_t elemSiz = stringEncodingLength(&op->uri);
   elemSiz += stringEncodingLength(&op->host);
@@ -1197,7 +1191,6 @@ static int computeFlowSampleSize(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
         siz += 8; /* tag, length */
         elemSiz = 0;
         switch(elem->tag) {
-        case SFLFLOW_MEMCACHE: elemSiz = memcacheOpEncodingLength(&elem->flowType.memcache);  break;
         case SFLFLOW_HTTP: elemSiz = httpOpEncodingLength(&elem->flowType.http);  break;
         case SFLFLOW_EX_SOCKET4: elemSiz = XDRSIZ_SFLEXTENDED_SOCKET4;  break;
         case SFLFLOW_EX_SOCKET6: elemSiz = XDRSIZ_SFLEXTENDED_SOCKET6;  break;
@@ -1285,15 +1278,6 @@ int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
         switch(elem->tag) {
         case SFLFLOW_EX_SOCKET4: putSocket4(receiver, &elem->flowType.socket4); break;
         case SFLFLOW_EX_SOCKET6: putSocket6(receiver, &elem->flowType.socket6); break;
-        case SFLFLOW_MEMCACHE:
-            putNet32(receiver, elem->flowType.memcache.protocol);
-            putNet32(receiver, elem->flowType.memcache.command);
-            putString(receiver, &elem->flowType.memcache.key);
-            putNet32(receiver, elem->flowType.memcache.nkeys);
-            putNet32(receiver, elem->flowType.memcache.value_bytes);
-            putNet32(receiver, elem->flowType.memcache.duration_uS);
-            putNet32(receiver, elem->flowType.memcache.status);
-            break;
         case SFLFLOW_HTTP:
             putNet32(receiver, elem->flowType.http.method);
             putNet32(receiver, elem->flowType.http.protocol);
@@ -1445,7 +1429,6 @@ static int computeCountersSampleSize(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
            structures are expanded to be 64-bit aligned */
 
         switch(elem->tag) {
-        case SFLCOUNTERS_MEMCACHE: elemSiz = XDRSIZ_SFLMEMCACHE_COUNTERS /*sizeof(elem->counterBlock.memcache)*/;  break;
         case SFLCOUNTERS_HTTP: elemSiz = XDRSIZ_SFLHTTP_COUNTERS /*sizeof(elem->counterBlock.http)*/;  break;
         default:
             {
@@ -1516,41 +1499,6 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
         putNet32(receiver, elem->length); /* length cached in computeCountersSampleSize() */
     
         switch(elem->tag) {
-        case SFLCOUNTERS_MEMCACHE:
-            putNet32(receiver, elem->counterBlock.memcache.uptime);
-            putNet32(receiver, elem->counterBlock.memcache.rusage_user);
-            putNet32(receiver, elem->counterBlock.memcache.rusage_system);
-            putNet32(receiver, elem->counterBlock.memcache.curr_connections);
-            putNet32(receiver, elem->counterBlock.memcache.total_connections);
-            putNet32(receiver, elem->counterBlock.memcache.connection_structures);
-            putNet32(receiver, elem->counterBlock.memcache.cmd_get);
-            putNet32(receiver, elem->counterBlock.memcache.cmd_set);
-            putNet32(receiver, elem->counterBlock.memcache.cmd_flush);
-            putNet32(receiver, elem->counterBlock.memcache.get_hits);
-            putNet32(receiver, elem->counterBlock.memcache.get_misses);
-            putNet32(receiver, elem->counterBlock.memcache.delete_misses);
-            putNet32(receiver, elem->counterBlock.memcache.delete_hits);
-            putNet32(receiver, elem->counterBlock.memcache.incr_misses);
-            putNet32(receiver, elem->counterBlock.memcache.incr_hits);
-            putNet32(receiver, elem->counterBlock.memcache.decr_misses);
-            putNet32(receiver, elem->counterBlock.memcache.decr_hits);
-            putNet32(receiver, elem->counterBlock.memcache.cas_misses);
-            putNet32(receiver, elem->counterBlock.memcache.cas_hits);
-            putNet32(receiver, elem->counterBlock.memcache.cas_badval);
-            putNet32(receiver, elem->counterBlock.memcache.auth_cmds);
-            putNet32(receiver, elem->counterBlock.memcache.auth_errors);
-            putNet64(receiver, elem->counterBlock.memcache.bytes_read);
-            putNet64(receiver, elem->counterBlock.memcache.bytes_written);
-            putNet32(receiver, elem->counterBlock.memcache.limit_maxbytes);
-            putNet32(receiver, elem->counterBlock.memcache.accepting_conns);
-            putNet32(receiver, elem->counterBlock.memcache.listen_disabled_num);
-            putNet32(receiver, elem->counterBlock.memcache.threads);
-            putNet32(receiver, elem->counterBlock.memcache.conn_yields);
-            putNet64(receiver, elem->counterBlock.memcache.bytes);
-            putNet32(receiver, elem->counterBlock.memcache.curr_items);
-            putNet32(receiver, elem->counterBlock.memcache.total_items);
-            putNet32(receiver, elem->counterBlock.memcache.evictions);
-            break;
         case SFLCOUNTERS_HTTP:
             putNet32(receiver, elem->counterBlock.http.method_option_count);
             putNet32(receiver, elem->counterBlock.http.method_get_count);
