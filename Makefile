@@ -17,7 +17,7 @@ APACHECTL=apachectl
 #INCLUDES=-Imy/include/dir
 #LIBS=-Lmy/lib/dir -lmylib
 
-CFLAGS=-g -ggdb
+CFLAGS=-g -ggdb -Wall
 
 #   the default target
 all: local-shared-build

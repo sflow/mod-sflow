@@ -1661,6 +1661,7 @@ static bool releaseOrDie(pthread_mutex_t *sem) {
     return true;
 }
 
+#if 0 /* not using this now */
 static void *sfwb_shared_mem_calloc(SFWB *sm, size_t bytes) {
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "sfwb_shared_mem_calloc - used=%u total=%u",
@@ -1674,6 +1675,7 @@ static void *sfwb_shared_mem_calloc(SFWB *sm, size_t bytes) {
     sm->shared_bytes_used += roundedup;
     return ptr;
 }
+#endif
 
 /* ================ master agent callbacks ===========================*/
 
@@ -2112,7 +2114,10 @@ void sflow_tick(SFWB *sm) {
 
 void sflow_init(SFWB *sm) {
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: sFlow=%p pid=%u config=%p", sm, getpid(), sm->config);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: sFlow=%p pid=%u config=%p",
+                 (void *)sm,
+                 getpid(),
+                 (void *)&sm->config);
 
     if(sm->configFile == NULL) {
         sm->configFile = SFWB_DEFAULT_CONFIGFILE;
@@ -2387,7 +2392,6 @@ static void sfwb_childcb_error(void *magic, SFLAgent *agent, char *msg)
 
 static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
-    int rc;
     SFWB *sm = GET_CONFIG_DATA(s);
     if(!sm->enabled) return;
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u\n", getpid(),MYGETTID);
@@ -2526,7 +2530,6 @@ static SFLHTTP_method methodNumberLookup(int method)
 
 static int sflow_multi_log_transaction(request_rec *r)
 {
-    int n;
     SFWB *sm = GET_CONFIG_DATA(r->server);
     SFWBChild *child = sm->child;
     apr_time_t now_uS = apr_time_now();
