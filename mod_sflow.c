@@ -56,13 +56,20 @@
 #include "apr.h"
 #include "apr_lib.h"
 #include "apr_strings.h"
+#include "apr_atomic.h"
 #include "httpd.h"
 #include "http_config.h"
 #include "http_protocol.h"
 #include "http_log.h"
 #include "ap_config.h"
+#include "ap_mpm.h"
+#include "sys/syscall.h" /* just for gettid() */
 
 #include "sflow_wb.h"
+
+#define MYINC32(i) apr_atomic_inc32(&i)
+#define MYDEC32(i) apr_atomic_dec32(&i)
+#define MYGETTID (pid_t)syscall(SYS_gettid)
 
 /* ==========================================================*/
 /* ==========================================================*/
@@ -748,9 +755,9 @@ void sfl_random_init(uint32_t seed) {
 int sfl_sampler_takeSample(SFLSampler *sampler)
 {
     /* increment the samplePool */
-    sampler->samplePool++;
+    MYINC32(sampler->samplePool);
 
-    if(--sampler->skip == 0) {
+    if(unlikely(MYDEC32(sampler->skip) == 0)) {
         /* reached zero. Set the next skip and return true. */
         sampler->skip = sfl_random((2 * sampler->sFlowFsPacketSamplingRate) - 1);
         return 1;
@@ -1707,7 +1714,6 @@ static void sfwb_cb_error(void *magic, SFLAgent *agent, char *msg)
 static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
 {
     SFWB *sm = (SFWB *)poller->magic;
-    lockOrDie(sm->mutex);
     {
         
         if(!sm->configOK) {
@@ -1725,7 +1731,6 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
         sfl_poller_writeCountersSample(poller, cs);
 
     }
-	releaseOrDie(sm->mutex);
 }
 
 static bool ipv4MappedAddress(SFLIPv6 *ipv6addr, SFLIPv4 *ip4addr) {
@@ -2074,7 +2079,6 @@ static void sfwb_apply_config(SFWB *sm, SFWBConfig *config)
         return;
     }
 
-    lockOrDie(sm->mutex);
     if(config) {
         sm->config = *config; /* structure copy */
         sm->configOK = true;
@@ -2082,7 +2086,6 @@ static void sfwb_apply_config(SFWB *sm, SFWBConfig *config)
     else {
         sm->configOK = false;
     }
-    releaseOrDie(sm->mutex);
 
     if(sm->configOK) {
         sflow_init(sm);
@@ -2136,7 +2139,6 @@ void sflow_init(SFWB *sm) {
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: building sFlow agent");
 
-    lockOrDie(sm->mutex);
     {
         /* create/re-create the agent */
         if(sm->agent) {
@@ -2201,7 +2203,6 @@ void sflow_init(SFWB *sm) {
 
         }
     }
-    releaseOrDie(sm->mutex);
 }
 
 /* ==========================================================*/
@@ -2336,15 +2337,9 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 {
     int rc;
     SFWB *sm = apr_pcalloc(p, sizeof(SFWB));
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "create_sflow_config - pid=%u\n", getpid());
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "create_sflow_config - pid=%u,tid=%u\n", getpid(), MYGETTID);
     sm->configFile = SFWB_DEFAULT_CONFIGFILE;
     sm->enabled = true; /* could be controlled by config cmd (see below) */
-
-    /* a mutex for sync */
-    if(sm->mutex == NULL) {
-        sm->mutex = (pthread_mutex_t*)apr_pcalloc(p, sizeof(pthread_mutex_t));
-        pthread_mutex_init(sm->mutex, NULL);
-    }
 
     /* a pool to use for the agent so we can recycle the memory easily on a config change */
     if((rc = apr_pool_create(&sm->masterPool, p)) != APR_SUCCESS) {
@@ -2355,7 +2350,7 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 
 static int sflow_pre_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp)
 {
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "sflow_pre_config - pid=%u\n", getpid());
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "sflow_pre_config - pid=%u,tid=%u\n", getpid(),MYGETTID);
     return OK;
 }
 
@@ -2363,8 +2358,9 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 {
     void *flag;
     SFWB *sm = GET_CONFIG_DATA(s);
+    int mpm_threaded = 0;
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u\n", getpid());
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u\n", getpid(),MYGETTID);
 
     /* All post_config hooks are called twice, we're only interested in the second call. */
     apr_pool_userdata_get(&flag, MOD_SFLOW_USERDATA_KEY, s->process->pool);
@@ -2372,7 +2368,11 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY, apr_pool_cleanup_null, s->process->pool);
         return OK;
     }
-    
+
+    if(ap_mpm_query(AP_MPMQ_IS_THREADED, &mpm_threaded) == APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "sflow_post_config - threaded=%u\n", mpm_threaded);
+    }
+
     if(sm && sm->enabled && sm->sFlowProc == NULL) {
         start_sflow_master(p, s, sm);
     }
@@ -2401,7 +2401,7 @@ static void sflow_init_worker(apr_pool_t *p, server_rec *s)
     int rc;
     SFWB *sm = GET_CONFIG_DATA(s);
     if(!sm->enabled) return;
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_worker - pid=%u\n", getpid());
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_worker - pid=%u,tid=%u\n", getpid(),MYGETTID);
     /* create my own private state, and hang it off the shared state */
     SFWBWorker *wk = (SFWBWorker *)apr_pcalloc(p, sizeof(SFWBWorker));
     sm->wk = wk;
@@ -2410,6 +2410,13 @@ static void sflow_init_worker(apr_pool_t *p, server_rec *s)
     wk->workerPool = p;
     /* shared_mem base address - may be different for each worker, so put in private state */
     wk->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem);
+
+    /* a mutex for sync between worker threads */
+    if(wk->mutex == NULL) {
+        wk->mutex = (pthread_mutex_t*)apr_pcalloc(p, sizeof(pthread_mutex_t));
+        pthread_mutex_init(wk->mutex, NULL);
+    }
+
     /* create my own sFlow agent+sampler+receiver just so I can use it to encode XDR messages */
     /* before sending them down the pipe */
     wk->agent = (SFLAgent *)apr_pcalloc(p, sizeof(SFLAgent));
@@ -2464,7 +2471,7 @@ static int sflow_handler_test(request_rec *r)
 
 static int sflow_handler(request_rec *r)
 {
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_handler - pid=%u\n", getpid());
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_handler - pid=%u,tid=%u\n", getpid(),MYGETTID);
     return OK;
 }
 
@@ -2536,6 +2543,16 @@ static int sflow_multi_log_transaction(request_rec *r)
     apr_time_t now_uS = apr_time_now();
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)\n", wk->sampler->skip);
     uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
+
+    /* For now, just lock this whole step.  Most times through here we do very little anyway.
+       It looks like we should switch to a probabililty-test for the sampling rather than a
+       countdown, since that would make it easier to only lock the mutex when we are actually taking
+       a sample.  It may also be necessary to change the counter/sample-pool accumulation so that
+       the shared counters only ever increment and the delta is calculated when we send the latest
+       counters.  Otherwise the clearing of the counters when we take a sample would require that
+       we lock just to increment them here,  even if we use apr_atomic_inc32() to do it? */
+    lockOrDie(wk->mutex);
+
     SFLHTTP_counters *ctrs = &wk->http_counters.counterBlock.http;
     switch(method) {
     case SFHTTP_HEAD: ctrs->method_head_count++; break;
@@ -2556,11 +2573,11 @@ static int sflow_multi_log_transaction(request_rec *r)
     else if(r->status < 600) ctrs->status_5XX_count++;    
     else ctrs->status_other_count++;
    
-    if(sfl_sampler_get_sFlowFsPacketSamplingRate(wk->sampler) == 0) {
+    if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(wk->sampler) == 0)) {
         /* don't have a sampling-rate setting yet. Check to see... */
         sflow_set_random_skip(wk);
     }
-    else if(sfl_sampler_takeSample(wk->sampler)) {
+    else if(unlikely(sfl_sampler_takeSample(wk->sampler))) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow take sample: r->method_number=%u\n", r->method_number);
         /* point to the start of the datagram */
         uint32_t *msg = wk->receiver->sampleCollector.datap;
@@ -2648,6 +2665,8 @@ static int sflow_multi_log_transaction(request_rec *r)
         /* check in case the sampling-rate setting has changed. */
         sflow_set_random_skip(wk);
     }
+
+    releaseOrDie(wk->mutex);
 
     return OK;
 }
