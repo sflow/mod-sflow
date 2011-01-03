@@ -1726,7 +1726,7 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
             return;
         }
 
-        /* per-worker counters have been accumulated into this shared-memory block, so we can just submit it */
+        /* per-child counters have been accumulated into this shared-memory block, so we can just submit it */
         SFLADD_ELEMENT(cs, &sm->http_counters);
         sfl_poller_writeCountersSample(poller, cs);
 
@@ -2196,7 +2196,7 @@ void sflow_init(SFWB *sm) {
         sfl_sampler_set_sFlowFsReceiver(sm->sampler, 1 /* receiver index == 1 */);
         
         if(sm->config.sampling_n) {
-            /* IPC to the workers */
+            /* IPC to the child processes */
             SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
             shared->sflow_skip1 = sm->config.sampling_n;
             shared->sflow_skip2 = sm->config.sampling_n;
@@ -2290,7 +2290,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master - pid=%u\n", getpid());
 
-    /* create the pipe that the workers will use to send samples to the master */
+    /* create the pipe that the child processes will use to send samples to the master */
     /* wanted to use apr_file_pipe_create_ex(...APR_FULL_NONBLOCK..) but it seems to be a new addition */
     if((status=apr_file_pipe_create(&sm->pipe_read, &sm->pipe_write, p)) != OK) {
         ap_log_error(APLOG_MARK, APLOG_ERR, status, s, "apr_file_pipe_create() failed");
@@ -2305,7 +2305,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
         /* should try again with a filename. $$$ */
         return HTTP_INTERNAL_SERVER_ERROR;
     }
-    sm->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem); /* each worker must call again */
+    sm->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem); /* each child must call again */
 
     sm->http_counters.tag = SFLCOUNTERS_HTTP;
 
@@ -2379,73 +2379,73 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
     return OK;
 }
 
-static void *sfwb_workercb_alloc(void *magic, SFLAgent *agent, size_t bytes)
+static void *sfwb_childcb_alloc(void *magic, SFLAgent *agent, size_t bytes)
 {
     SFWB *sm = (SFWB *)magic;
-    return apr_pcalloc(sm->wk->workerPool, bytes);
+    return apr_pcalloc(sm->child->childPool, bytes);
 }
 
-static int sfwb_workercb_free(void *magic, SFLAgent *agent, void *obj)
+static int sfwb_childcb_free(void *magic, SFLAgent *agent, void *obj)
 {
     /* do nothing - we'll free the whole sub-pool when we are ready */
     return 0;
 }
 
-static void sfwb_workercb_error(void *magic, SFLAgent *agent, char *msg)
+static void sfwb_childcb_error(void *magic, SFLAgent *agent, char *msg)
 {
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "sFlow worker agent error: %s", msg);
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "sFlow child agent error: %s", msg);
 }
 
-static void sflow_init_worker(apr_pool_t *p, server_rec *s)
+static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
     int rc;
     SFWB *sm = GET_CONFIG_DATA(s);
     if(!sm->enabled) return;
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_worker - pid=%u,tid=%u\n", getpid(),MYGETTID);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u\n", getpid(),MYGETTID);
     /* create my own private state, and hang it off the shared state */
-    SFWBWorker *wk = (SFWBWorker *)apr_pcalloc(p, sizeof(SFWBWorker));
-    sm->wk = wk;
+    SFWBChild *child = (SFWBChild *)apr_pcalloc(p, sizeof(SFWBChild));
+    sm->child = child;
     /* remember the config pool so the allocation callback can use it (no
        need for a sub-pool here because we don't need to recycle) */
-    wk->workerPool = p;
-    /* shared_mem base address - may be different for each worker, so put in private state */
-    wk->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem);
+    child->childPool = p;
+    /* shared_mem base address - may be different for each child, so put in private state */
+    child->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem);
 
-    /* a mutex for sync between worker threads */
-    if(wk->mutex == NULL) {
-        wk->mutex = (pthread_mutex_t*)apr_pcalloc(p, sizeof(pthread_mutex_t));
-        pthread_mutex_init(wk->mutex, NULL);
+    /* a mutex to allow worker threads in the same child process to avoid tripping over each other */
+    if(child->mutex == NULL) {
+        child->mutex = (pthread_mutex_t*)apr_pcalloc(p, sizeof(pthread_mutex_t));
+        pthread_mutex_init(child->mutex, NULL);
     }
 
     /* create my own sFlow agent+sampler+receiver just so I can use it to encode XDR messages */
     /* before sending them down the pipe */
-    wk->agent = (SFLAgent *)apr_pcalloc(p, sizeof(SFLAgent));
+    child->agent = (SFLAgent *)apr_pcalloc(p, sizeof(SFLAgent));
     SFLAddress myIP = { 0 }; /* blank address */
-    sfl_agent_init(wk->agent,
+    sfl_agent_init(child->agent,
                    &myIP,
                    getpid(), /* subAgentId */
                    sm->currentTime,
                    sm->currentTime,
                    sm,
-                   sfwb_workercb_alloc,
-                   sfwb_workercb_free,
-                   sfwb_workercb_error,
+                   sfwb_childcb_alloc,
+                   sfwb_childcb_free,
+                   sfwb_childcb_error,
                    NULL);
 
-    wk->receiver = sfl_agent_addReceiver(wk->agent);
-    sfl_receiver_set_sFlowRcvrOwner(wk->receiver, "httpd sFlow Probe - worker");
-    sfl_receiver_set_sFlowRcvrTimeout(wk->receiver, 0xFFFFFFFF);
+    child->receiver = sfl_agent_addReceiver(child->agent);
+    sfl_receiver_set_sFlowRcvrOwner(child->receiver, "httpd sFlow Probe - child");
+    sfl_receiver_set_sFlowRcvrTimeout(child->receiver, 0xFFFFFFFF);
     SFLDataSource_instance dsi;
     memset(&dsi, 0, sizeof(dsi)); /* will be ignored anyway */
-    wk->sampler = sfl_agent_addSampler(wk->agent, &dsi);
-    sfl_sampler_set_sFlowFsReceiver(wk->sampler, 1 /* receiver index*/);
+    child->sampler = sfl_agent_addSampler(child->agent, &dsi);
+    sfl_sampler_set_sFlowFsReceiver(child->sampler, 1 /* receiver index*/);
     /* seed the random number generator */
     sfl_random_init(getpid());
     /* we'll pick up the sampling_rate later. Don't want to insist
      * on it being present at startup - don't want to delay the
      * startup if we can avoid it.  Just set it to 0 so we check for
      * it. Otherwise it will start out as the default (400) */
-    sfl_sampler_set_sFlowFsPacketSamplingRate(wk->sampler, 0);
+    sfl_sampler_set_sFlowFsPacketSamplingRate(child->sampler, 0);
 }
 
 static int sflow_handler_test(request_rec *r)
@@ -2475,9 +2475,9 @@ static int sflow_handler(request_rec *r)
     return OK;
 }
 
-static int read_shared_sampling_n(SFWBWorker *wk)
+static int read_shared_sampling_n(SFWBChild *child)
 {
-    SFWBShared *shared = (SFWBShared *)wk->shared_mem_base;
+    SFWBShared *shared = (SFWBShared *)child->shared_mem_base;
     /* read it twice to avoid requiring a lock (does this work?) */
     uint32_t sflow_skip1 = shared->sflow_skip1;
     uint32_t sflow_skip2 = shared->sflow_skip2;
@@ -2485,14 +2485,14 @@ static int read_shared_sampling_n(SFWBWorker *wk)
     return (sflow_skip1 == sflow_skip2) ? sflow_skip1 : -1;
 }
 
-static void sflow_set_random_skip(SFWBWorker *wk)
+static void sflow_set_random_skip(SFWBChild *child)
 {
-    int n = read_shared_sampling_n(wk);
+    int n = read_shared_sampling_n(child);
     if(n >= 0) {
         /* got a valid setting */
-        if(n != sfl_sampler_get_sFlowFsPacketSamplingRate(wk->sampler)) {
+        if(n != sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler)) {
             /* it has changed */
-            sfl_sampler_set_sFlowFsPacketSamplingRate(wk->sampler, n);
+            sfl_sampler_set_sFlowFsPacketSamplingRate(child->sampler, n);
         }
     }
 }
@@ -2539,9 +2539,9 @@ static int sflow_multi_log_transaction(request_rec *r)
 {
     int n;
     SFWB *sm = GET_CONFIG_DATA(r->server);
-    SFWBWorker *wk = sm->wk;
+    SFWBChild *child = sm->child;
     apr_time_t now_uS = apr_time_now();
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)\n", wk->sampler->skip);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)\n", child->sampler->skip);
     uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
 
     /* For now, just lock this whole step.  Most times through here we do very little anyway.
@@ -2551,9 +2551,9 @@ static int sflow_multi_log_transaction(request_rec *r)
        the shared counters only ever increment and the delta is calculated when we send the latest
        counters.  Otherwise the clearing of the counters when we take a sample would require that
        we lock just to increment them here,  even if we use apr_atomic_inc32() to do it? */
-    lockOrDie(wk->mutex);
+    lockOrDie(child->mutex);
 
-    SFLHTTP_counters *ctrs = &wk->http_counters.counterBlock.http;
+    SFLHTTP_counters *ctrs = &child->http_counters.counterBlock.http;
     switch(method) {
     case SFHTTP_HEAD: ctrs->method_head_count++; break;
     case SFHTTP_GET: ctrs->method_get_count++; break;
@@ -2573,31 +2573,31 @@ static int sflow_multi_log_transaction(request_rec *r)
     else if(r->status < 600) ctrs->status_5XX_count++;    
     else ctrs->status_other_count++;
    
-    if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(wk->sampler) == 0)) {
+    if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler) == 0)) {
         /* don't have a sampling-rate setting yet. Check to see... */
-        sflow_set_random_skip(wk);
+        sflow_set_random_skip(child);
     }
-    else if(unlikely(sfl_sampler_takeSample(wk->sampler))) {
+    else if(unlikely(sfl_sampler_takeSample(child->sampler))) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow take sample: r->method_number=%u\n", r->method_number);
         /* point to the start of the datagram */
-        uint32_t *msg = wk->receiver->sampleCollector.datap;
+        uint32_t *msg = child->receiver->sampleCollector.datap;
         /* msglen, msgType, sample pool and drops */
-        put32(wk->receiver, 0); /* we'll come back and fill this in later */
-        put32(wk->receiver, SFLFLOW_SAMPLE);
-        put32(wk->receiver, SFLFLOW_HTTP);
-        put32(wk->receiver, wk->sampler->samplePool);
-        put32(wk->receiver, wk->sampler->dropEvents);
+        put32(child->receiver, 0); /* we'll come back and fill this in later */
+        put32(child->receiver, SFLFLOW_SAMPLE);
+        put32(child->receiver, SFLFLOW_HTTP);
+        put32(child->receiver, child->sampler->samplePool);
+        put32(child->receiver, child->sampler->dropEvents);
         /* and reset so they can be accumulated by the other process */
-        wk->sampler->samplePool = 0;
-        wk->sampler->dropEvents = 0;
+        child->sampler->samplePool = 0;
+        child->sampler->dropEvents = 0;
         /* accumulate the pktlen here too, to satisfy a sanity-check in the sflow library (receiver) */
-        wk->receiver->sampleCollector.pktlen += 20;
+        child->receiver->sampleCollector.pktlen += 20;
 
         const char *referer = apr_table_get(r->headers_in, "Referer");
         const char *useragent = apr_table_get(r->headers_in, "User-Agent");
         const char *contentType = apr_table_get(r->headers_in, "Content-Type");
         /* encode the transaction sample next */
-        sflow_sample_http(wk->sampler,
+        sflow_sample_http(child->sampler,
                           r->connection,
                           method,
                           r->proto_num,
@@ -2612,7 +2612,7 @@ static int sflow_multi_log_transaction(request_rec *r)
                           r->status);
 
         /* get the message bytes including the sample */
-        uint32_t msgBytes = (wk->receiver->sampleCollector.datap - msg) << 2;
+        uint32_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
         /* write this in as the first 32-bit word */
         *msg = msgBytes;
         /* if greater than 4096 the pipe write will not be atomic. Should never happen, */
@@ -2620,31 +2620,31 @@ static int sflow_multi_log_transaction(request_rec *r)
         if(msgBytes > 4096) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds 4096-byte limit for atomic write", msgBytes);
             /* this counts as an sFlow drop-event */
-            wk->sampler->dropEvents++;
+            child->sampler->dropEvents++;
         }
         else if(apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytes) != APR_SUCCESS) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
             /* this counts as an sFlow drop-event */
-            wk->sampler->dropEvents++;
+            child->sampler->dropEvents++;
         }
-        resetSampleCollector(wk->receiver);
+        resetSampleCollector(child->receiver);
     }
 
     
-    if((now_uS - wk->lastTickTime) > SFWB_WORKER_TICK_US) {
-        wk->lastTickTime = now_uS;
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "worker tick - sending counters\n");
+    if((now_uS - child->lastTickTime) > SFWB_CHILD_TICK_US) {
+        child->lastTickTime = now_uS;
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "child tick - sending counters\n");
         /* point to the start of the datagram */
-        uint32_t *msg = wk->receiver->sampleCollector.datap;
+        uint32_t *msg = child->receiver->sampleCollector.datap;
         /* msglen, msgType, msgId */
-        put32(wk->receiver, 0); /* we'll come back and fill this in later */
-        put32(wk->receiver, SFLCOUNTERS_SAMPLE);
-        put32(wk->receiver, SFLCOUNTERS_HTTP);
-        putOpaque(wk->receiver, (char *)ctrs, sizeof(*ctrs));
+        put32(child->receiver, 0); /* we'll come back and fill this in later */
+        put32(child->receiver, SFLCOUNTERS_SAMPLE);
+        put32(child->receiver, SFLCOUNTERS_HTTP);
+        putOpaque(child->receiver, (char *)ctrs, sizeof(*ctrs));
         /* now reset my private counter block so that we only send the delta each time */
         memset(ctrs, 0, sizeof(*ctrs));
         /* get the msg bytes */
-        uint32_t msgBytes = (wk->receiver->sampleCollector.datap - msg) << 2;
+        uint32_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
         /* write this in as the first 32-bit word */
         *msg = msgBytes;
 
@@ -2653,20 +2653,20 @@ static int sflow_multi_log_transaction(request_rec *r)
         if(msgBytes > 4096) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds 4096-byte limit for atomic write", msgBytes);
             /* this counts as an sFlow drop-event */
-            wk->sampler->dropEvents++;
+            child->sampler->dropEvents++;
         }
         else if(apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytes) != APR_SUCCESS) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
             /* this counts as an sFlow drop-event */
-            wk->sampler->dropEvents++;
+            child->sampler->dropEvents++;
         }
-        resetSampleCollector(wk->receiver);
+        resetSampleCollector(child->receiver);
 
         /* check in case the sampling-rate setting has changed. */
-        sflow_set_random_skip(wk);
+        sflow_set_random_skip(child);
     }
 
-    releaseOrDie(wk->mutex);
+    releaseOrDie(child->mutex);
 
     return OK;
 }
@@ -2675,7 +2675,7 @@ static void sflow_register_hooks(apr_pool_t *p)
 {
     ap_hook_pre_config(sflow_pre_config,NULL,NULL,APR_HOOK_REALLY_FIRST);
     ap_hook_post_config(sflow_post_config,NULL,NULL,APR_HOOK_MIDDLE);
-    ap_hook_child_init(sflow_init_worker,NULL,NULL,APR_HOOK_MIDDLE);
+    ap_hook_child_init(sflow_init_child,NULL,NULL,APR_HOOK_MIDDLE);
     ap_hook_handler(sflow_handler_test, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_handler(sflow_handler, NULL, NULL, APR_HOOK_LAST);
     ap_hook_log_transaction(sflow_multi_log_transaction,NULL,NULL,APR_HOOK_MIDDLE);
