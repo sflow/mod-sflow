@@ -46,7 +46,7 @@ typedef u_int8_t bool;
 /* SFWB_MAX LINE LEN must be enough to hold the whole list of targets */
 #define SFWB_MAX_LINELEN 1024
 #define SFWB_MAX_COLLECTORS 10
-#define SFWB_WORKER_TICK_US 2000000
+#define SFWB_CHILD_TICK_US 2000000
 #define SFWB_CONFIG_CHECK_S 10
 
 typedef struct _SFWBCollector {
@@ -66,7 +66,7 @@ typedef struct _SFWBConfig {
 } SFWBConfig;
 
 
-typedef struct _SFWBWorker {
+typedef struct _SFWBChild {
   pthread_mutex_t *mutex;
   void *shared_mem_base; /* may be a different address for each worker */
   SFLAgent *agent;
@@ -74,8 +74,8 @@ typedef struct _SFWBWorker {
   SFLSampler *sampler;
   SFLCounters_sample_element http_counters;
   apr_time_t lastTickTime;
-  apr_pool_t *workerPool;
-} SFWBWorker;
+  apr_pool_t *childPool;
+} SFWBChild;
 
 typedef struct _SFWB {
   int enabled;
@@ -102,18 +102,18 @@ typedef struct _SFWB {
   SFLPoller *poller;
   SFLCounters_sample_element http_counters;
 
-  /* pipe for worker->master IPC */
+  /* pipe for child->master IPC */
   apr_file_t *pipe_read;
   apr_file_t *pipe_write;
 
-  /* shared mem for master->worker IPC */
+  /* shared mem for master->child IPC */
   apr_shm_t *shared_mem;
   void *shared_mem_base;
   size_t shared_bytes_total;
   size_t shared_bytes_used;
 
-  /* per worker state */
-  SFWBWorker *wk;
+  /* per child state */
+  SFWBChild *child;
 } SFWB;
 
 typedef struct _SFWBShared {
