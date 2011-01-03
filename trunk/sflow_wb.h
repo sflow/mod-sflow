@@ -67,6 +67,7 @@ typedef struct _SFWBConfig {
 
 
 typedef struct _SFWBWorker {
+  pthread_mutex_t *mutex;
   void *shared_mem_base; /* may be a different address for each worker */
   SFLAgent *agent;
   SFLReceiver *receiver;
@@ -77,7 +78,6 @@ typedef struct _SFWBWorker {
 } SFWBWorker;
 
 typedef struct _SFWB {
-  pthread_mutex_t *mutex;
   int enabled;
 
   /* master process */
@@ -126,6 +126,14 @@ void sflow_sample(SFWB *sm, int soc, SFLHTTP_method method, uint32_t protocol, c
 #define SFLOW_TOKENS_UNKNOWN 0
 void sflow_init(SFWB *sm);
 void sflow_tick(SFWB *sm);
+
+/* If supported, give compiler hints for branch prediction. */
+#if !defined(__GNUC__) || (__GNUC__ == 2 && __GNUC_MINOR__ < 96)
+#define __builtin_expect(x, expected_value) (x)
+#endif
+
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
 
 #endif /* SFLOW_WB_H */
 
