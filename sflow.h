@@ -77,54 +77,6 @@ typedef struct _SFLExtended_socket_ipv6 {
 
 #define XDRSIZ_SFLEXTENDED_SOCKET6 44
 
-typedef enum  {
-  SFMC_PROT_OTHER   = 0,
-  SFMC_PROT_ASCII   = 1,
-  SFMC_PROT_BINARY  = 2,
-} SFLMemcache_prot;
-
-typedef enum  {
-  SFMC_CMD_OTHER    = 0,
-  SFMC_CMD_SET      = 1,
-  SFMC_CMD_ADD      = 2,
-  SFMC_CMD_REPLACE  = 3,
-  SFMC_CMD_APPEND   = 4,
-  SFMC_CMD_PREPEND  = 5,
-  SFMC_CMD_CAS      = 6,
-  SFMC_CMD_GET      = 7,
-  SFMC_CMD_GETS     = 8,
-  SFMC_CMD_INCR     = 9,
-  SFMC_CMD_DECR     = 10,
-  SFMC_CMD_DELETE   = 11,
-  SFMC_CMD_STATS    = 12,
-  SFMC_CMD_FLUSH    = 13,
-  SFMC_CMD_VERSION  = 14,
-  SFMC_CMD_QUIT     = 15,
-} SFLMemcache_cmd;
-
-typedef enum  {
-  SFMC_OP_UNKNOWN      = 0,
-  SFMC_OP_OK           = 1,
-  SFMC_OP_ERROR        = 2,
-  SFMC_OP_CLIENT_ERROR = 3,
-  SFMC_OP_SERVER_ERROR = 4,
-  SFMC_OP_STORED       = 5,
-  SFMC_OP_NOT_STORED   = 6,
-  SFMC_OP_EXISTS       = 7,
-  SFMC_OP_NOT_FOUND    = 8,
-  SFMC_OP_DELETED      = 9,
-} SFLMemcache_operation_status;
-
-typedef struct _SFLSampled_memcache {
-  uint32_t protocol;    /* SFLMemcache_prot */
-  uint32_t command;     /* SFLMemcache_cmd */
-  SFLString key;        /* up to 255 chars */
-  uint32_t nkeys;    
-  uint32_t value_bytes;
-  uint32_t duration_uS;
-  uint32_t status;      /* SFLMemcache_operation_status */
-} SFLSampled_memcache;
-
 typedef enum {
   SFHTTP_OTHER    = 0,
   SFHTTP_OPTIONS  = 1,
@@ -155,12 +107,11 @@ enum SFLFlow_type_tag {
   /* enterprise = 0, format = ... */
   SFLFLOW_EX_SOCKET4      = 2100,
   SFLFLOW_EX_SOCKET6      = 2101,
-  SFLFLOW_MEMCACHE        = 2200,
+  /* SFLFLOW_MEMCACHE        = 2200, */
   SFLFLOW_HTTP            = 2201,
 };
 
 typedef union _SFLFlow_type {
-  SFLSampled_memcache memcache;
   SFLSampled_http http;
   SFLExtended_socket_ipv4 socket4;
   SFLExtended_socket_ipv6 socket6;
@@ -242,50 +193,6 @@ typedef struct _SFLFlow_sample_expanded {
 
 /* Counter types */
 
-#define XDRSIZ_SFLHOST_VRT_NIO_COUNTERS 40
-
-typedef struct _SFLMemcache_counters {
-  uint32_t uptime;     /* Number of seconds this server has been running */
-  uint32_t rusage_user;    /* Accumulated user time for this process (ms)*/
-  uint32_t rusage_system;  /* Accumulated system time for this process (ms)*/
-  uint32_t curr_connections; /* Number of open connections */
-  uint32_t total_connections; /* Total number of connections opened since
-				 the server started running */
-  uint32_t connection_structures; /* Number of connection structures
-				     allocated by the server */
-  uint32_t cmd_get;        /* Cumulative number of retrieval requests */
-  uint32_t cmd_set;        /* Cumulative number of storage requests */
-  uint32_t cmd_flush;      /* */
-  uint32_t get_hits;       /* Number of keys that have been requested and
-			      found present */
-  uint32_t get_misses;     /* Number of items that have been requested
-			      and not found */
-  uint32_t delete_misses;
-  uint32_t delete_hits;
-  uint32_t incr_misses;
-  uint32_t incr_hits;
-  uint32_t decr_misses;
-  uint32_t decr_hits;
-  uint32_t cas_misses;
-  uint32_t cas_hits;
-  uint32_t cas_badval;
-  uint32_t auth_cmds;
-  uint32_t auth_errors;
-  uint64_t bytes_read;
-  uint64_t bytes_written;
-  uint32_t limit_maxbytes;
-  uint32_t accepting_conns;
-  uint32_t listen_disabled_num;
-  uint32_t threads;
-  uint32_t conn_yields;
-  uint64_t bytes;
-  uint32_t curr_items;
-  uint32_t total_items;
-  uint32_t evictions;
-} SFLMemcache_counters;
-
-#define XDRSIZ_SFLMEMCACHE_COUNTERS (36*4)
-
 typedef struct _SFLHTTP_counters {
   uint32_t method_option_count;
   uint32_t method_get_count;
@@ -310,12 +217,11 @@ typedef struct _SFLHTTP_counters {
 
 enum SFLCounters_type_tag {
   /* enterprise = 0, format = ... */
-  SFLCOUNTERS_MEMCACHE      = 2200, /* memcached counters */
+  /* SFLCOUNTERS_MEMCACHE      = 2200, */ /* memcached counters */
   SFLCOUNTERS_HTTP          = 2201, /* http counters */
 };
 
 typedef union _SFLCounters_type {
-  SFLMemcache_counters memcache;
   SFLHTTP_counters http;
 } SFLCounters_type;
 
