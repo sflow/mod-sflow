@@ -37,20 +37,55 @@
 **
 **  This module reads it sFlow configuration from the /etc/hsflowd.auto
 **  file that is generated automatically when you run the host-sflow
-**  daemon hsflowd on the same server:
+**  daemon "hsflowd" on the same server:
 **
 **  http://host-sflow.sourceforge.net
 **
 **  The hsflowd daemon includes a DNS-SD client so it can learn the
 **  sFlow configuration automatically,  and the /etc/hsflowd.auto file
 **  is then a way to share it with other sFlow sub-agents running on
-**  the same host, such as this apache module.
+**  the same host, such as this apache module.  (That's why the configuration
+**  is read from /etc/hsflowd.auto and not from httpd.conf).
 **
 **  The sFlow output goes to a UDP port on your sFlow collector host.
 **  There you can examine it using a number of tools,  including the
 **  freeware "sflowtool", which can be downloaded as source code from:
 **  
 **  http://www.inmon.com/technology/sflowTools.php
+**
+**
+**  This source file consists of three sections:
+**  1. sFlow API (Generic sFlow encoding, with agent, sampler, poller and receiver)
+**  2. sFlow Web (HTTP/web-specific extensions)
+**  3. mod-sflow hooks
+**
+**  In order to bring the samples and counters together in one sFlow agent
+**  we have the post_config hook fork a separate process and open a pipe
+**  to it.  This process runs the "master" sFlow agent that will actually
+**  read the sFlow configuration and send UDP datagrams to the collector.  A
+**  small shared-memory segment is created too.  Each child process that apache
+**  subsequently forks will inherit handles for both the pipe and the shared memory.
+**  The pipe is used by each child to send samples to the master,  and the
+**  shared memory is used by the master to share configuration changes with
+**  the child processes.
+**
+**  Each child process uses the sFlow API to create his own private "child"
+**  sFlow agent,  since that allows him to take advantage of the code for
+**  random sampling and XDR encoding.  We had to serialize the data onto the
+**  pipe anyway so it made sense to use the XDR encoding.  That way the "master"
+**  agent can simply copy the pre-encoded samples directly into the output
+**  buffer.
+**
+**  mutual-exclusion
+**  ================
+**  Using a pipe here for the many-to-one child-to-master communication was
+**  convenient because writing to the pipe also provides mutual-exclusion
+**  between the different child process (since the messages are less that 4096
+**  bytes the write() calls are effectively atomic).  To allow this module to
+**  work in servers with MPM=worker (as well as MPM=prefork) an additional mutex
+**  was used in each child process.  This allows multiple worker-threads to
+**  share the same "child" sFlow agent.
+**
 */ 
 
 #include "apr.h"
@@ -2358,6 +2393,7 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 {
     void *flag;
     SFWB *sm = GET_CONFIG_DATA(s);
+    int rc;
     int mpm_threaded = 0;
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u\n", getpid(),MYGETTID);
@@ -2369,9 +2405,14 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         return OK;
     }
 
-    if(ap_mpm_query(AP_MPMQ_IS_THREADED, &mpm_threaded) == APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "sflow_post_config - threaded=%u\n", mpm_threaded);
+    if((rc = ap_mpm_query(AP_MPMQ_IS_THREADED, &mpm_threaded)) == APR_SUCCESS) {
+        /* We could perhaps use this information to decided whether to create the mutex in each child */
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u\n", mpm_threaded);
     }
+    else {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed\n");
+    }
+
 
     if(sm && sm->enabled && sm->sFlowProc == NULL) {
         start_sflow_master(p, s, sm);
