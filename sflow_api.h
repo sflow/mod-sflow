@@ -347,4 +347,17 @@ uint32_t sfl_receiver_samplePacketsSent(SFLReceiver *receiver);
 #define SFL_ALLOC malloc
 #define SFL_FREE free
 
+/* If supported, give compiler hints for branch prediction. */
+#if !defined(__GNUC__) || (__GNUC__ == 2 && __GNUC_MINOR__ < 96)
+#define __builtin_expect(x, expected_value) (x)
+#endif
+
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
+
+/* selective exposure of some internal hooks,  just for this project */
+void sfl_receiver_put32(SFLReceiver *receiver, uint32_t val);
+void sfl_receiver_putOpaque(SFLReceiver *receiver, char *val, int len);
+void sfl_receiver_resetSampleCollector(SFLReceiver *receiver);
+
 #endif /* SFLOW_API_H */
