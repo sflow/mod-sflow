@@ -3,72 +3,51 @@
 /* http://www.inmon.com/technology/sflowlicense.txt */
 
 /* 
-**  mod_sflow.c -- Apache sample sflow module.
+** mod_sflow
+** =========
 **
-**  A binary, random-sampling logger designed for:
+**  A binary, random-sampling Apache module designed for:
 **       lightweight,
 **        centralized,
 **         continuous,
 **          real-time monitoring of very large and very busy web farms.
 **
-**  To try this module first compile it into a
-**  DSO file and install it into Apache's modules directory 
-**  and add it to the apache httpd.conf config file by running:
 **
-**    $ apxs -c -i -a mod_sflow.c sflow_api.c
+**  For details on compiling, installing and running this module, see the
+**  README file that came with the download.
 **
-**  Then restart Apache via
+**  design
+**  ======
+**  In order to report the samples and counters from a single sFlow agent
+**  with a single sub-agent, the challenge is to bring the data together
+**  from the various child processes (and threads within them) that may
+**  be handling HTTP requests.
 **
-**    $ apachectl restart
-**
-**  This module reads it sFlow configuration from the /etc/hsflowd.auto
-**  file that is generated automatically when you run the host-sflow
-**  daemon "hsflowd" on the same server:
-**
-**  http://host-sflow.sourceforge.net
-**
-**  The sFlow output goes to a UDP port on your sFlow collector host.
-**  There you can examine it using a number of tools,  including the
-**  freeware "sflowtool", which can be downloaded as source code from:
-**  
-**  http://www.inmon.com/technology/sflowTools.php
-**
-**  For example, to log all the values in ASCII:
-** 
-**  $ sflowtool
-**
-**  Or to log the HTTP samples in common-log-file format:
-**
-**  $ sflowtool -H
-**
-**  This source file consists of three sections:
-**  1. sFlow API (Generic sFlow encoding, with agent, sampler, poller and receiver)
-**  2. sFlow Web (HTTP/web-specific extensions)
-**  3. mod-sflow hooks
-**
-**  In order to bring the samples and counters together in one sFlow agent
-**  we have the post_config hook fork a separate process and open a pipe
+**  The post_config hook forks a separate process and open a pipe
 **  to it.  This process runs the "master" sFlow agent that will actually
-**  read the sFlow configuration and send UDP datagrams to the collector.  A
-**  small shared-memory segment is created too.  Each child process that apache
-**  subsequently forks will inherit handles for both the pipe and the shared memory.
+**  read the sFlow configuration and send UDP datagrams to the collector.
+**
+**  A small shared-memory segment is created too.  Each child process that
+**  Apache subsequently forks will inherit handles for both the pipe and the
+**  shared memory.
+**
 **  The pipe is used by each child to send samples to the master,  and the
-**  shared memory is used by the master to share configuration changes with
+**  shared memory is used by the master to pass configuration changes to
 **  the child processes.
 **
 **  Each child process uses the sFlow API to create his own private "child"
 **  sFlow agent,  since that allows him to take advantage of the code for
-**  random sampling and XDR encoding.  We had to serialize the data onto the
-**  pipe anyway so it made sense to use the XDR encoding.  That way the "master"
-**  agent can simply copy the pre-encoded samples directly into the output
-**  buffer.
+**  random sampling and XDR encoding.  (We have to serialize the data onto the
+**  pipe anyway so it makes sense to use the XDR encoding and take advantage
+**  of the library code to do that).  The "master" agent can simply copy
+**  the pre-encoded samples directly into the output packet.
 **
 **  mutual-exclusion
 **  ================
 **  Using a pipe here for the many-to-one child-to-master communication was
 **  convenient because writing to the pipe also provides mutual-exclusion
 **  between the different child process (since the messages are less that 4096
-**  bytes the write() calls are effectively atomic).  To allow this module to
+**  bytes the write() calls are guaranteed atomic).  To allow this module to
 **  work in servers with MPM=worker (as well as MPM=prefork) an additional mutex
 **  was used in each child process.  This allows multiple worker-threads to
 **  share the same "child" sFlow agent.
