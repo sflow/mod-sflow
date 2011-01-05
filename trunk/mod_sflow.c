@@ -1239,10 +1239,13 @@ static int sflow_multi_log_transaction(request_rec *r)
             /* this counts as an sFlow drop-event */
             child->sampler->dropEvents++;
         }
-        else if(apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytes) != APR_SUCCESS) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
-            /* this counts as an sFlow drop-event */
-            child->sampler->dropEvents++;
+        else {
+            apr_size_t msgBytes2 = (apr_size_t)msgBytes;
+            if(apr_file_write_full(sm->pipe_write, msg, msgBytes2, &msgBytes2) != APR_SUCCESS) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
+                /* this counts as an sFlow drop-event */
+                child->sampler->dropEvents++;
+            }
         }
         sfl_receiver_resetSampleCollector(child->receiver);
     }
@@ -1272,10 +1275,13 @@ static int sflow_multi_log_transaction(request_rec *r)
             /* this counts as an sFlow drop-event */
             child->sampler->dropEvents++;
         }
-        else if(apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytes) != APR_SUCCESS) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
-            /* this counts as an sFlow drop-event */
-            child->sampler->dropEvents++;
+        else {
+            apr_size_t msgBytes2 = (apr_size_t)msgBytes;
+            if(apr_file_write_full(sm->pipe_write, msg, msgBytes2, &msgBytes2) != APR_SUCCESS) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
+                /* this counts as an sFlow drop-event */
+                child->sampler->dropEvents++;
+            }
         }
         sfl_receiver_resetSampleCollector(child->receiver);
 
