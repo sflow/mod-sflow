@@ -197,7 +197,6 @@ typedef struct _SFWB {
   SFLReceiver *receiver;
   SFLSampler *sampler;
   SFLPoller *poller;
-  SFLCounters_sample_element http_counters;
 
   /* pipe for child->master IPC */
   apr_file_t *pipe_read;
@@ -214,8 +213,8 @@ typedef struct _SFWB {
 } SFWB;
 
 typedef struct _SFWBShared {
-  uint32_t sflow_skip1;
-  uint32_t sflow_skip2;
+  uint32_t sflow_skip;
+  SFLCounters_sample_element http_counters;
 } SFWBShared;
 
 /*_________________---------------------------__________________
@@ -286,23 +285,21 @@ static void sfwb_cb_error(void *magic, SFLAgent *agent, char *msg)
 static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
 {
     SFWB *sm = (SFWB *)poller->magic;
-    {
+    SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
         
-        if(!sm->configOK) {
-            /* config is disabled */
-            return;
-        }
-        
-        if(sm->config.polling_secs == 0) {
-            /* polling is off */
-            return;
-        }
-
-        /* per-child counters have been accumulated into this shared-memory block, so we can just submit it */
-        SFLADD_ELEMENT(cs, &sm->http_counters);
-        sfl_poller_writeCountersSample(poller, cs);
-
+    if(!sm->configOK) {
+        /* config is disabled */
+        return;
     }
+    
+    if(sm->config.polling_secs == 0) {
+        /* polling is off */
+        return;
+    }
+
+    /* per-child counters have been accumulated into this shared-memory block, so we can just submit it */
+    SFLADD_ELEMENT(cs, &shared->http_counters);
+    sfl_poller_writeCountersSample(poller, cs);
 }
 
 static void sfwb_cb_sendPkt(void *magic, SFLAgent *agent, SFLReceiver *receiver, u_char *pkt, uint32_t pktLen)
@@ -803,9 +800,7 @@ static void sflow_init(SFWB *sm)
         if(sm->config.sampling_n) {
             /* IPC to the child processes */
             SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
-            shared->sflow_skip1 = sm->config.sampling_n;
-            shared->sflow_skip2 = sm->config.sampling_n;
-
+            shared->sflow_skip = sm->config.sampling_n;
         }
     }
 }
@@ -852,24 +847,25 @@ static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
                 uint32_t *datap = msg;
                 if(msgType == SFLCOUNTERS_SAMPLE && msgId == SFLCOUNTERS_HTTP) {
                     /* counter block */
+                    SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
                     SFLHTTP_counters c;
                     memcpy(&c, datap, sizeof(c));
                     /* accumulate into my total */
-                    sm->http_counters.counterBlock.http.method_option_count += c.method_option_count;
-                    sm->http_counters.counterBlock.http.method_get_count += c.method_get_count;
-                    sm->http_counters.counterBlock.http.method_head_count += c.method_head_count;
-                    sm->http_counters.counterBlock.http.method_post_count += c.method_post_count;
-                    sm->http_counters.counterBlock.http.method_put_count += c.method_put_count;
-                    sm->http_counters.counterBlock.http.method_delete_count += c.method_delete_count;
-                    sm->http_counters.counterBlock.http.method_trace_count += c.method_trace_count;
-                    sm->http_counters.counterBlock.http.method_connect_count += c.method_connect_count;
-                    sm->http_counters.counterBlock.http.method_other_count += c.method_other_count;
-                    sm->http_counters.counterBlock.http.status_1XX_count += c.status_1XX_count;
-                    sm->http_counters.counterBlock.http.status_2XX_count += c.status_2XX_count;
-                    sm->http_counters.counterBlock.http.status_3XX_count += c.status_3XX_count;
-                    sm->http_counters.counterBlock.http.status_4XX_count += c.status_4XX_count;
-                    sm->http_counters.counterBlock.http.status_5XX_count += c.status_5XX_count;
-                    sm->http_counters.counterBlock.http.status_other_count += c.status_other_count;
+                    shared->http_counters.counterBlock.http.method_option_count += c.method_option_count;
+                    shared->http_counters.counterBlock.http.method_get_count += c.method_get_count;
+                    shared->http_counters.counterBlock.http.method_head_count += c.method_head_count;
+                    shared->http_counters.counterBlock.http.method_post_count += c.method_post_count;
+                    shared->http_counters.counterBlock.http.method_put_count += c.method_put_count;
+                    shared->http_counters.counterBlock.http.method_delete_count += c.method_delete_count;
+                    shared->http_counters.counterBlock.http.method_trace_count += c.method_trace_count;
+                    shared->http_counters.counterBlock.http.method_connect_count += c.method_connect_count;
+                    shared->http_counters.counterBlock.http.method_other_count += c.method_other_count;
+                    shared->http_counters.counterBlock.http.status_1XX_count += c.status_1XX_count;
+                    shared->http_counters.counterBlock.http.status_2XX_count += c.status_2XX_count;
+                    shared->http_counters.counterBlock.http.status_3XX_count += c.status_3XX_count;
+                    shared->http_counters.counterBlock.http.status_4XX_count += c.status_4XX_count;
+                    shared->http_counters.counterBlock.http.status_5XX_count += c.status_5XX_count;
+                    shared->http_counters.counterBlock.http.status_other_count += c.status_other_count;
                 }
                 else if(msgType == SFLFLOW_SAMPLE && msgId == SFLFLOW_HTTP) {
                     sm->sampler->samplePool += *datap++;
@@ -913,7 +909,8 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     }
     sm->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem); /* each child must call again */
 
-    sm->http_counters.tag = SFLCOUNTERS_HTTP;
+    SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
+    shared->http_counters.tag = SFLCOUNTERS_HTTP;
 
     sm->sFlowProc = apr_palloc(p, sizeof(apr_proc_t));
     ap_assert(sm->sFlowProc);
@@ -1081,11 +1078,8 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
 static int read_shared_sampling_n(SFWBChild *child)
 {
     SFWBShared *shared = (SFWBShared *)child->shared_mem_base;
-    /* read it twice to avoid requiring a lock (does this work?) */
-    uint32_t sflow_skip1 = shared->sflow_skip1;
-    uint32_t sflow_skip2 = shared->sflow_skip2;
-    /* if it's not stable, just use the value we had before */
-    return (sflow_skip1 == sflow_skip2) ? sflow_skip1 : -1;
+    /* it's a 32-bit aligned read, so we don't need a lock */
+    return shared->sflow_skip;
 }
 
 /*_________________---------------------------__________________
@@ -1295,6 +1289,45 @@ static int sflow_multi_log_transaction(request_rec *r)
 }
 
 /*_________________---------------------------__________________
+  _________________      sflow_hander         __________________
+  -----------------___________________________------------------
+*/
+
+static int sflow_handler(request_rec *r)
+{
+    if (strcmp(r->handler, "sflow")) {
+        return DECLINED;
+    }
+    r->content_type = "text/html";      
+
+    if (!r->header_only) {
+        if(r->server) {
+            SFWB *sm = GET_CONFIG_DATA(r->server);
+            if(sm) {
+                SFWBShared *shared = (SFWBShared *)sm->child->shared_mem_base;
+                ap_rprintf(r, "method_option_count %u<br />\n", shared->http_counters.counterBlock.http.method_option_count);
+                ap_rprintf(r, "method_get_count %u<br />\n", shared->http_counters.counterBlock.http.method_get_count);
+                ap_rprintf(r, "method_head_count %u<br />\n", shared->http_counters.counterBlock.http.method_head_count);
+                ap_rprintf(r, "method_post_count %u<br />\n", shared->http_counters.counterBlock.http.method_post_count);
+                ap_rprintf(r, "method_put_count %u<br />\n", shared->http_counters.counterBlock.http.method_put_count);
+                ap_rprintf(r, "method_delete_count %u<br />\n", shared->http_counters.counterBlock.http.method_delete_count);
+                ap_rprintf(r, "method_trace_count %u<br />\n", shared->http_counters.counterBlock.http.method_trace_count);
+                ap_rprintf(r, "method_connect_count %u<br />\n", shared->http_counters.counterBlock.http.method_connect_count);
+                ap_rprintf(r, "method_other_count %u<br />\n", shared->http_counters.counterBlock.http.method_other_count);
+                ap_rprintf(r, "status_1XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_1XX_count);
+                ap_rprintf(r, "status_2XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_2XX_count);
+                ap_rprintf(r, "status_3XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_3XX_count);
+                ap_rprintf(r, "status_4XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_4XX_count);
+                ap_rprintf(r, "status_5XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_5XX_count);
+                ap_rprintf(r, "status_other_count %u<br />\n", shared->http_counters.counterBlock.http.status_other_count);
+            }
+        }
+    }
+
+    return OK;
+}
+
+/*_________________---------------------------__________________
   _________________   sflow_register_hooks    __________________
   -----------------___________________________------------------
 */
@@ -1303,6 +1336,7 @@ static void sflow_register_hooks(apr_pool_t *p)
 {
     ap_hook_post_config(sflow_post_config,NULL,NULL,APR_HOOK_MIDDLE);
     ap_hook_child_init(sflow_init_child,NULL,NULL,APR_HOOK_MIDDLE);
+    ap_hook_handler(sflow_handler, NULL, NULL, APR_HOOK_LAST);
     ap_hook_log_transaction(sflow_multi_log_transaction,NULL,NULL,APR_HOOK_MIDDLE);
 }
 
