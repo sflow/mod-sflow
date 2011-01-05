@@ -147,74 +147,76 @@ module AP_MODULE_DECLARE_DATA sflow_module;
 */
 
 typedef struct _SFWBCollector {
-  struct sockaddr sa;
-  SFLAddress addr;
-  uint16_t port;
-  uint16_t priority;
+    struct sockaddr sa;
+    SFLAddress addr;
+    uint16_t port;
+    uint16_t priority;
 } SFWBCollector;
 
 typedef struct _SFWBConfig {
-  int error;
-  uint32_t sampling_n;
-  uint32_t polling_secs;
-  SFLAddress agentIP;
-  uint32_t num_collectors;
-  SFWBCollector collectors[SFWB_MAX_COLLECTORS];
+    int error;
+    uint32_t sampling_n;
+    int got_sampling_n_http;
+    uint32_t polling_secs;
+    int got_polling_secs_http;
+    SFLAddress agentIP;
+    uint32_t num_collectors;
+    SFWBCollector collectors[SFWB_MAX_COLLECTORS];
 } SFWBConfig;
 
 
 typedef struct _SFWBChild {
-  pthread_mutex_t *mutex;
-  void *shared_mem_base; /* may be a different address for each worker */
-  SFLAgent *agent;
-  SFLReceiver *receiver;
-  SFLSampler *sampler;
-  SFLCounters_sample_element http_counters;
-  apr_time_t lastTickTime;
-  apr_pool_t *childPool;
+    pthread_mutex_t *mutex;
+    void *shared_mem_base; /* may be a different address for each worker */
+    SFLAgent *agent;
+    SFLReceiver *receiver;
+    SFLSampler *sampler;
+    SFLCounters_sample_element http_counters;
+    apr_time_t lastTickTime;
+    apr_pool_t *childPool;
 } SFWBChild;
 
 typedef struct _SFWB {
-  int enabled;
+    int enabled;
 
-  /* master process */
-  apr_proc_t *sFlowProc;
-  apr_pool_t *masterPool;
+    /* master process */
+    apr_proc_t *sFlowProc;
+    apr_pool_t *masterPool;
 
-  /* master config */
-  time_t currentTime;
-  int configCountDown;
-  char *configFile;
-  time_t configFile_modTime;
-  bool configOK;
-  SFWBConfig config;
-  SFWBConfig newConfig;
+    /* master config */
+    time_t currentTime;
+    int configCountDown;
+    char *configFile;
+    time_t configFile_modTime;
+    bool configOK;
+    SFWBConfig config;
+    SFWBConfig newConfig;
 
-  /* master sFlow agent */
-  int socket4;
-  int socket6;
-  SFLAgent *agent;
-  SFLReceiver *receiver;
-  SFLSampler *sampler;
-  SFLPoller *poller;
+    /* master sFlow agent */
+    int socket4;
+    int socket6;
+    SFLAgent *agent;
+    SFLReceiver *receiver;
+    SFLSampler *sampler;
+    SFLPoller *poller;
 
-  /* pipe for child->master IPC */
-  apr_file_t *pipe_read;
-  apr_file_t *pipe_write;
+    /* pipe for child->master IPC */
+    apr_file_t *pipe_read;
+    apr_file_t *pipe_write;
 
-  /* shared mem for master->child IPC */
-  apr_shm_t *shared_mem;
-  void *shared_mem_base;
-  size_t shared_bytes_total;
-  size_t shared_bytes_used;
+    /* shared mem for master->child IPC */
+    apr_shm_t *shared_mem;
+    void *shared_mem_base;
+    size_t shared_bytes_total;
+    size_t shared_bytes_used;
 
-  /* per child state */
-  SFWBChild *child;
+    /* per child state */
+    SFWBChild *child;
 } SFWB;
 
 typedef struct _SFWBShared {
-  uint32_t sflow_skip;
-  SFLCounters_sample_element http_counters;
+    uint32_t sflow_skip;
+    SFLCounters_sample_element http_counters;
 } SFWBShared;
 
 /*_________________---------------------------__________________
@@ -528,7 +530,7 @@ static bool sfwb_lookupAddress(char *name, struct sockaddr *sa, SFLAddress *addr
   _________________   config file parsing     __________________
   -----------------___________________________------------------
 
-read or re-read the sFlow config
+  read or re-read the sFlow config
 */
 
 static bool sfwb_syntaxOK(SFWBConfig *cfg, uint32_t line, uint32_t tokc, uint32_t tokcMin, uint32_t tokcMax, char *syntax) {
@@ -602,11 +604,27 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
             }
             else if(strcasecmp(tokv[0], "sampling") == 0
                     && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "sampling=<int>")) {
+                if(!config->got_sampling_n_http) {
+                    config->sampling_n = strtol(tokv[1], NULL, 0);
+                }
+            }
+            else if(strcasecmp(tokv[0], "sampling.http") == 0
+                    && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "sampling.http=<int>")) {
+                /* sampling.http takes precedence over sampling */
                 config->sampling_n = strtol(tokv[1], NULL, 0);
+                config->got_sampling_n_http = true;
             }
             else if(strcasecmp(tokv[0], "polling") == 0 
                     && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "polling=<int>")) {
+                if(!config->got_polling_secs_http) {
+                    config->polling_secs = strtol(tokv[1], NULL, 0);
+                }
+            }
+            else if(strcasecmp(tokv[0], "polling.http") == 0 
+                    && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "polling.http=<int>")) {
+                /* polling.http takes precedence over polling */
                 config->polling_secs = strtol(tokv[1], NULL, 0);
+                config->got_polling_secs_http = true;
             }
             else if(strcasecmp(tokv[0], "agentIP") == 0
                     && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "agentIP=<IP address>|<IPv6 address>")) {
@@ -786,7 +804,7 @@ static void sflow_init(SFWB *sm)
         /* ds_class = <logicalEntity>, ds_index = 65537, ds_instance = 0 */
         /* $$$ should learn the ds_index from the config file */
         SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, 65537, 0);
-        
+          
         /* add a poller for the counters */
         sm->poller = sfl_agent_addPoller(sm->agent, &dsi, sm, sfwb_cb_counters);
         sfl_poller_set_sFlowCpInterval(sm->poller, sm->config.polling_secs);
@@ -831,9 +849,9 @@ static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             uint32_t msgType = msg[1];
             uint32_t msgId = msg[2];
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - msgType/id = %u/%u msgBytes=%u\n",
-                     msgType,
-                     msgId,
-                     msgBytes);
+                         msgType,
+                         msgId,
+                         msgBytes);
             ap_assert(msgType == SFLCOUNTERS_SAMPLE || msgType == SFLFLOW_SAMPLE);
             ap_assert(msgBytes <= 4096);
             size_t bodyBytes = msgBytes - hdrBytes;
@@ -1305,21 +1323,24 @@ static int sflow_handler(request_rec *r)
             SFWB *sm = GET_CONFIG_DATA(r->server);
             if(sm) {
                 SFWBShared *shared = (SFWBShared *)sm->child->shared_mem_base;
-                ap_rprintf(r, "method_option_count %u<br />\n", shared->http_counters.counterBlock.http.method_option_count);
-                ap_rprintf(r, "method_get_count %u<br />\n", shared->http_counters.counterBlock.http.method_get_count);
-                ap_rprintf(r, "method_head_count %u<br />\n", shared->http_counters.counterBlock.http.method_head_count);
-                ap_rprintf(r, "method_post_count %u<br />\n", shared->http_counters.counterBlock.http.method_post_count);
-                ap_rprintf(r, "method_put_count %u<br />\n", shared->http_counters.counterBlock.http.method_put_count);
-                ap_rprintf(r, "method_delete_count %u<br />\n", shared->http_counters.counterBlock.http.method_delete_count);
-                ap_rprintf(r, "method_trace_count %u<br />\n", shared->http_counters.counterBlock.http.method_trace_count);
-                ap_rprintf(r, "method_connect_count %u<br />\n", shared->http_counters.counterBlock.http.method_connect_count);
-                ap_rprintf(r, "method_other_count %u<br />\n", shared->http_counters.counterBlock.http.method_other_count);
-                ap_rprintf(r, "status_1XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_1XX_count);
-                ap_rprintf(r, "status_2XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_2XX_count);
-                ap_rprintf(r, "status_3XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_3XX_count);
-                ap_rprintf(r, "status_4XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_4XX_count);
-                ap_rprintf(r, "status_5XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_5XX_count);
-                ap_rprintf(r, "status_other_count %u<br />\n", shared->http_counters.counterBlock.http.status_other_count);
+                ap_rprintf(r, "counter method_option_count %u<br />\n", shared->http_counters.counterBlock.http.method_option_count);
+                ap_rprintf(r, "counter method_get_count %u<br />\n", shared->http_counters.counterBlock.http.method_get_count);
+                ap_rprintf(r, "counter method_head_count %u<br />\n", shared->http_counters.counterBlock.http.method_head_count);
+                ap_rprintf(r, "counter method_post_count %u<br />\n", shared->http_counters.counterBlock.http.method_post_count);
+                ap_rprintf(r, "counter method_put_count %u<br />\n", shared->http_counters.counterBlock.http.method_put_count);
+                ap_rprintf(r, "counter method_delete_count %u<br />\n", shared->http_counters.counterBlock.http.method_delete_count);
+                ap_rprintf(r, "counter method_trace_count %u<br />\n", shared->http_counters.counterBlock.http.method_trace_count);
+                ap_rprintf(r, "counter method_connect_count %u<br />\n", shared->http_counters.counterBlock.http.method_connect_count);
+                ap_rprintf(r, "counter method_other_count %u<br />\n", shared->http_counters.counterBlock.http.method_other_count);
+                ap_rprintf(r, "counter status_1XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_1XX_count);
+                ap_rprintf(r, "counter status_2XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_2XX_count);
+                ap_rprintf(r, "counter status_3XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_3XX_count);
+                ap_rprintf(r, "counter status_4XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_4XX_count);
+                ap_rprintf(r, "counter status_5XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_5XX_count);
+                ap_rprintf(r, "counter status_other_count %u<br />\n", shared->http_counters.counterBlock.http.status_other_count);
+                /* extra info */
+                ap_rprintf(r, "string hostname %s<br />\n", r->hostname);
+                ap_rprintf(r, "gauge sampling_n %u<br />\n", shared->sflow_skip);
             }
         }
     }
@@ -1336,7 +1357,7 @@ static void sflow_register_hooks(apr_pool_t *p)
 {
     ap_hook_post_config(sflow_post_config,NULL,NULL,APR_HOOK_MIDDLE);
     ap_hook_child_init(sflow_init_child,NULL,NULL,APR_HOOK_MIDDLE);
-    ap_hook_handler(sflow_handler, NULL, NULL, APR_HOOK_LAST);
+    ap_hook_handler(sflow_handler, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_log_transaction(sflow_multi_log_transaction,NULL,NULL,APR_HOOK_MIDDLE);
 }
 
