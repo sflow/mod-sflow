@@ -54,49 +54,23 @@
 **
 */ 
 
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <string.h>
-#include <time.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <syslog.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <assert.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/resource.h>
-#include <sys/uio.h>
-#include <ctype.h>
-#include <fcntl.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <limits.h>
-#include <sysexits.h>
-#include <stddef.h>
-#include <sys/wait.h>
-#include <sys/types.h>
-#define __STDC_FORMAT_MACROS
-#include <inttypes.h> /* for PRIu64 etc. */
-#include <pthread.h>
-
-#include "sys/syscall.h" /* just for gettid() */
-#define MYGETTID (pid_t)syscall(SYS_gettid)
-
+/* Apache Runtime Library */
 #include "apr.h"
-#include "apr_lib.h"
-#include "apr_strings.h"
+
+/* Apache HTTPD includes */
 #include "httpd.h"
 #include "http_config.h"
 #include "http_protocol.h"
 #include "http_log.h"
-#include "ap_config.h"
-#include "ap_mpm.h"
+
+/* sFlow library */
 #include "sflow_api.h"
+
+#ifdef SFWB_DEBUG
+#include "sys/syscall.h" /* just for gettid() */
+#define MYGETTID (pid_t)syscall(SYS_gettid)
+#include "ap_mpm.h"
+#endif
 
 /* #include <stdbool.h> */
 #define true 1
@@ -147,26 +121,25 @@ module AP_MODULE_DECLARE_DATA sflow_module;
 */
 
 typedef struct _SFWBCollector {
-    struct sockaddr sa;
-    SFLAddress addr;
-    uint16_t port;
+    apr_sockaddr_t *sa;
     uint16_t priority;
 } SFWBCollector;
 
 typedef struct _SFWBConfig {
     int error;
     uint32_t sampling_n;
-    int got_sampling_n_http;
     uint32_t polling_secs;
-    int got_polling_secs_http;
+    bool got_sampling_n_http;
+    bool got_polling_secs_http;
     SFLAddress agentIP;
     uint32_t num_collectors;
     SFWBCollector collectors[SFWB_MAX_COLLECTORS];
+    apr_pool_t *pool;
 } SFWBConfig;
 
 
 typedef struct _SFWBChild {
-    pthread_mutex_t *mutex;
+    apr_thread_mutex_t *mutex;
     void *shared_mem_base; /* may be a different address for each worker */
     SFLAgent *agent;
     SFLReceiver *receiver;
@@ -177,24 +150,25 @@ typedef struct _SFWBChild {
 } SFWBChild;
 
 typedef struct _SFWB {
-    int enabled;
+#ifdef SFWB_DEBUG
+    int mpm_threaded;
+#endif
 
     /* master process */
     apr_proc_t *sFlowProc;
     apr_pool_t *masterPool;
+    apr_pool_t *configPool;
 
     /* master config */
     time_t currentTime;
     int configCountDown;
     char *configFile;
     time_t configFile_modTime;
-    bool configOK;
-    SFWBConfig config;
-    SFWBConfig newConfig;
+    SFWBConfig *config;
 
     /* master sFlow agent */
-    int socket4;
-    int socket6;
+    apr_socket_t *socket4;
+    apr_socket_t *socket6;
     SFLAgent *agent;
     SFLReceiver *receiver;
     SFLSampler *sampler;
@@ -231,13 +205,13 @@ static void sflow_init(SFWB *sm);
   -----------------___________________________------------------
 */
 
-static bool lockOrDie(pthread_mutex_t *sem) {
-    ap_assert(sem == NULL || pthread_mutex_lock(sem) == 0);
+static bool lockOrDie(apr_thread_mutex_t *sem) {
+    ap_assert(sem == NULL || apr_thread_mutex_lock(sem) == 0);
     return true;
 }
 
-static bool releaseOrDie(pthread_mutex_t *sem) {
-    ap_assert(sem == NULL || pthread_mutex_unlock(sem) == 0);
+static bool releaseOrDie(apr_thread_mutex_t *sem) {
+    ap_assert(sem == NULL || apr_thread_mutex_unlock(sem) == 0);
     return true;
 }
 
@@ -289,12 +263,12 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
     SFWB *sm = (SFWB *)poller->magic;
     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
         
-    if(!sm->configOK) {
+    if(sm->config == NULL) {
         /* config is disabled */
         return;
     }
     
-    if(sm->config.polling_secs == 0) {
+    if(sm->config->polling_secs == 0) {
         /* polling is off */
         return;
     }
@@ -307,52 +281,24 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
 static void sfwb_cb_sendPkt(void *magic, SFLAgent *agent, SFLReceiver *receiver, u_char *pkt, uint32_t pktLen)
 {
     SFWB *sm = (SFWB *)magic;
-    size_t socklen = 0;
-    int fd = 0;
+    apr_socket_t *soc = NULL;
     int c = 0;
-    if(!sm->configOK) {
+    if(!sm->config) {
         /* config is disabled */
         return;
     }
 
-    for(c = 0; c < sm->config.num_collectors; c++) {
-        SFWBCollector *coll = &sm->config.collectors[c];
-        switch(coll->addr.type) {
-        case SFLADDRESSTYPE_UNDEFINED:
-            /* skip over it if the forward lookup failed */
-            break;
-        case SFLADDRESSTYPE_IP_V4:
-            {
-                struct sockaddr_in *sa = (struct sockaddr_in *)&(coll->sa);
-                socklen = sizeof(struct sockaddr_in);
-                sa->sin_family = AF_INET;
-                sa->sin_port = htons(coll->port);
-                fd = sm->socket4;
-            }
-            break;
-        case SFLADDRESSTYPE_IP_V6:
-            {
-                struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&(coll->sa);
-                socklen = sizeof(struct sockaddr_in6);
-                sa6->sin6_family = AF_INET6;
-                sa6->sin6_port = htons(coll->port);
-                fd = sm->socket6;
-            }
-            break;
-        }
-        
-        if(socklen && fd > 0) {
-            int result = sendto(fd,
-                                pkt,
-                                pktLen,
-                                0,
-                                (struct sockaddr *)&coll->sa,
-                                socklen);
-            if(result == -1 && errno != EINTR) {
+    for(c = 0; c < sm->config->num_collectors; c++) {
+        SFWBCollector *coll = &sm->config->collectors[c];
+        if(coll->sa) {
+            soc = (coll->sa->family == APR_INET6) ? sm->socket6 : sm->socket4;
+            apr_size_t len = (apr_size_t)pktLen;
+            int rc = apr_socket_sendto(soc, coll->sa, 0, (char *)pkt, &len);
+            if(rc != APR_SUCCESS && errno != EINTR) {
                 ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "socket sendto error");
             }
-            if(result == 0) {
-                ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "socket sendto returned 0");
+            if(len == 0) {
+                ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "socket sendto transmitted 0 bytes");
             }
         }
     }
@@ -418,44 +364,36 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
         apr_sockaddr_t *peersoc = connection->remote_addr;
 
         if(localsoc && peersoc) {
-            /* two possibilities here... */
-            struct sockaddr_in *rsoc4 = &peersoc->sa.sin;
-            struct sockaddr_in6 *rsoc6 = &peersoc->sa.sin6;
-            
             if(peersoc->ipaddr_len == 4 &&
-               peersoc->family == AF_INET &&
-               rsoc4->sin_family == AF_INET) {
-                struct sockaddr_in *lsoc4 = &localsoc->sa.sin;
+               peersoc->family == APR_INET) {
                 socElem.tag = SFLFLOW_EX_SOCKET4;
-                socElem.flowType.socket4.protocol = 6;
-                socElem.flowType.socket4.local_ip.addr = lsoc4->sin_addr.s_addr;
-                socElem.flowType.socket4.remote_ip.addr = rsoc4->sin_addr.s_addr;
-                socElem.flowType.socket4.local_port = ntohs(lsoc4->sin_port);
-                socElem.flowType.socket4.remote_port = ntohs(rsoc4->sin_port);
+                socElem.flowType.socket4.protocol = 6; /* TCP */
+                memcpy(&socElem.flowType.socket4.local_ip.addr, localsoc->ipaddr_ptr, 4);
+                memcpy(&socElem.flowType.socket4.remote_ip.addr, peersoc->ipaddr_ptr, 4);
+                socElem.flowType.socket4.local_port = ntohs(localsoc->port);
+                socElem.flowType.socket4.remote_port = ntohs(peersoc->port);
             }
             else if(peersoc->ipaddr_len == 16 &&
-                    peersoc->family == AF_INET6 &&
-                    rsoc6->sin6_family == AF_INET6) {
-                struct sockaddr_in6 *lsoc6 = &localsoc->sa.sin6;
+                    peersoc->family == APR_INET6) {
                 /* may still decide to export it as an IPv4 connection
                    if the addresses are really IPv4 addresses */
                 SFLIPv4 local_ip4addr, remote_ip4addr;
-                if(ipv4MappedAddress((SFLIPv6 *)&lsoc6->sin6_addr, &local_ip4addr) &&
-                   ipv4MappedAddress((SFLIPv6 *)&rsoc6->sin6_addr, &remote_ip4addr)) {
+                if(ipv4MappedAddress((SFLIPv6 *)localsoc->ipaddr_ptr, &local_ip4addr) &&
+                   ipv4MappedAddress((SFLIPv6 *)peersoc->ipaddr_ptr, &remote_ip4addr)) {
                     socElem.tag = SFLFLOW_EX_SOCKET4;
-                    socElem.flowType.socket4.protocol = 6;
+                    socElem.flowType.socket4.protocol = 6; /* TCP */
                     socElem.flowType.socket4.local_ip.addr = local_ip4addr.addr;
                     socElem.flowType.socket4.remote_ip.addr = remote_ip4addr.addr;
-                    socElem.flowType.socket4.local_port = ntohs(lsoc6->sin6_port);
-                    socElem.flowType.socket4.remote_port = ntohs(rsoc6->sin6_port);
+                    socElem.flowType.socket4.local_port = ntohs(localsoc->port);
+                    socElem.flowType.socket4.remote_port = ntohs(peersoc->port);
                 }
                 else {
                     socElem.tag = SFLFLOW_EX_SOCKET6;
-                    socElem.flowType.socket6.protocol = 6;
-                    memcpy(socElem.flowType.socket6.local_ip.addr, lsoc6->sin6_addr.s6_addr, 16);
-                    memcpy(socElem.flowType.socket6.remote_ip.addr, rsoc6->sin6_addr.s6_addr, 16);
-                    socElem.flowType.socket6.local_port = ntohs(lsoc6->sin6_port);
-                    socElem.flowType.socket6.remote_port = ntohs(rsoc6->sin6_port);
+                    socElem.flowType.socket6.protocol = 6; /* TCP */
+                    memcpy(socElem.flowType.socket6.local_ip.addr, localsoc->ipaddr_ptr, 16);
+                    memcpy(socElem.flowType.socket6.remote_ip.addr, peersoc->ipaddr_ptr, 16);
+                    socElem.flowType.socket6.local_port = ntohs(localsoc->port);
+                    socElem.flowType.socket6.remote_port = ntohs(peersoc->port);
                 }
             }
             
@@ -474,56 +412,47 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
 /*_________________---------------------------__________________
   _________________   address lookup          __________________
   -----------------___________________________------------------
+
+Look up an IP address and write into the SFLAddress slot provided.
+Discard everything else.
 */
 
-static bool sfwb_lookupAddress(char *name, struct sockaddr *sa, SFLAddress *addr, int family)
+static bool sfwb_lookupAddress(char *name, SFLAddress *addr, apr_pool_t *configPool)
 {
-    struct addrinfo *info = NULL;
-    struct addrinfo hints = { 0 };
-    hints.ai_socktype = SOCK_DGRAM; /* constrain this so we don't get lots of answers */
-    hints.ai_family = family; /* PF_INET, PF_INET6 or 0 */
-    int err = getaddrinfo(name, NULL, &hints, &info);
-    if(err) {
-        switch(err) {
-        case EAI_NONAME: break;
-        case EAI_NODATA: break;
-        case EAI_AGAIN: break; /* loop and try again? */
-        default: ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "getaddrinfo() error"); break;
-        }
+    int rc;
+    apr_sockaddr_t *sa = NULL;
+    apr_pool_t *pool = NULL;
+    int ans = false;
+
+    ap_assert(name != NULL);
+
+    if((rc = apr_pool_create(&pool, configPool)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "create_sflow_config: error creating lookupaddress sub-pool");
         return false;
     }
-    
-    if(info == NULL) return false;
-    
-    if(info->ai_addr) {
-        /* answer is now in info - a linked list of answers with sockaddr values. */
-        /* extract the address we want from the first one. */
-        switch(info->ai_family) {
-        case PF_INET:
-            {
-                struct sockaddr_in *ipsoc = (struct sockaddr_in *)info->ai_addr;
-                addr->type = SFLADDRESSTYPE_IP_V4;
-                addr->address.ip_v4.addr = ipsoc->sin_addr.s_addr;
-                if(sa) memcpy(sa, info->ai_addr, info->ai_addrlen);
-            }
+
+    if((rc = apr_sockaddr_info_get(&sa, name, APR_UNSPEC, 0, APR_IPV4_ADDR_OK, pool)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "sfwb_lookupaddress: apr_sockaddr_info_get(%s) failed", name);
+    }
+    else if(sa) {
+        switch(sa->family) {
+        case APR_INET:
+            addr->type = SFLADDRESSTYPE_IP_V4;
+            memcpy(&addr->address.ip_v4.addr, sa->ipaddr_ptr, 4);
+            ans = true;
             break;
-        case PF_INET6:
-            {
-                struct sockaddr_in6 *ip6soc = (struct sockaddr_in6 *)info->ai_addr;
-                addr->type = SFLADDRESSTYPE_IP_V6;
-                memcpy(&addr->address.ip_v6, &ip6soc->sin6_addr, 16);
-                if(sa) memcpy(sa, info->ai_addr, info->ai_addrlen);
-            }
+        case APR_INET6:
+            addr->type = SFLADDRESSTYPE_IP_V6;
+            memcpy(&addr->address.ip_v6, sa->ipaddr_ptr, 16);
+            ans = true;
             break;
         default:
-            ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "getaddrinfo(): unexpected address family: %d", info->ai_family);
-            return false;
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "getaddrinfo(): unexpected address family: %u", sa->family);
             break;
         }
     }
-    /* free the dynamically allocated data before returning */
-    freeaddrinfo(info);
-    return true;
+    apr_pool_destroy(pool);
+    return ans;
 }
 
 /*_________________---------------------------__________________
@@ -551,10 +480,19 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
 {
     uint32_t rev_start = 0;
     uint32_t rev_end = 0;
+    int rc;
+    apr_pool_t *pool;
 
-    /* avoid heap allocation. Use pre-allocated object */
-    SFWBConfig *config = &sm->newConfig;
-    memset(config, 0, sizeof(SFWBConfig));
+    /* create a sub-pool to allocate this new config from */
+    if((rc = apr_pool_create(&pool, sm->configPool)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "create_sflow_config: error creating new config sub-pool");
+        return NULL;
+    }
+    
+    SFWBConfig *config = apr_pcalloc(pool, sizeof(SFWBConfig));
+
+    /* remember my own subpool */
+    config->pool = pool;
 
     FILE *cfg = NULL;
     if((cfg = fopen(sm->configFile, "r")) == NULL) {
@@ -628,10 +566,7 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
             }
             else if(strcasecmp(tokv[0], "agentIP") == 0
                     && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "agentIP=<IP address>|<IPv6 address>")) {
-                if(sfwb_lookupAddress(tokv[1],
-                                      NULL,
-                                      &config->agentIP,
-                                      0) == false) {
+                if(sfwb_lookupAddress(tokv[1], &config->agentIP, pool) == false) {
                     sfwb_syntaxError(config, lineNo, "agent address lookup failed");
                 }
             }
@@ -639,14 +574,16 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
                     && sfwb_syntaxOK(config, lineNo, tokc, 2, 4, "collector=<IP address>[ <port>[ <priority>]]")) {
                 if(config->num_collectors < SFWB_MAX_COLLECTORS) {
                     uint32_t i = config->num_collectors++;
-                    if(sfwb_lookupAddress(tokv[1],
-                                          &config->collectors[i].sa,
-                                          &config->collectors[i].addr,
-                                          0) == false) {
-                        sfwb_syntaxError(config, lineNo, "collector address lookup failed");
-                    }
-                    config->collectors[i].port = tokc >= 3 ? strtol(tokv[2], NULL, 0) : 6343;
+                    uint32_t port = tokc >= 3 ? strtol(tokv[2], NULL, 0) : 6343;
                     config->collectors[i].priority = tokc >= 4 ? strtol(tokv[3], NULL, 0) : 0;
+                    if((rc = apr_sockaddr_info_get(&config->collectors[i].sa,
+                                                   tokv[1],
+                                                   APR_UNSPEC,
+                                                   port,
+                                                   APR_IPV4_ADDR_OK,
+                                                   pool)) != APR_SUCCESS) {
+                        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "create_sflow_config: error allocating collector socket address");
+                    }
                 }
                 else {
                     sfwb_syntaxError(config, lineNo, "exceeded max collectors");
@@ -671,6 +608,7 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
         return config;
     }
     else {
+        apr_pool_destroy(pool);
         return NULL;
     }
 }
@@ -682,22 +620,42 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
 
 static void sfwb_apply_config(SFWB *sm, SFWBConfig *config)
 {
-    if(config == NULL && !sm->configOK) {
-        /* no change required */
-        return;
-    }
+    SFWBConfig *oldConfig = sm->config;
 
     if(config) {
-        sm->config = *config; /* structure copy */
-        sm->configOK = true;
-    }
-    else {
-        sm->configOK = false;
-    }
-
-    if(sm->configOK) {
+        /* apply the new one */
+        sm->config = config;
         sflow_init(sm);
     }
+
+    if(oldConfig) {
+        /* free the old one */
+        apr_pool_destroy(oldConfig->pool);
+    }
+}
+
+/*_________________---------------------------__________________
+  _________________   config file mod-time    __________________
+  -----------------___________________________------------------
+*/
+        
+apr_time_t configModified(SFWB *sm) {
+    int rc;
+    apr_finfo_t configFileInfo;
+    apr_pool_t *p;
+    apr_time_t mtime = 0;
+    /* a pool for temporary allocation */
+    if((rc = apr_pool_create(&p, sm->configPool)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, " apr_pool_create() failed");
+    }
+    if((rc = apr_stat(&configFileInfo, sm->configFile, APR_FINFO_MTIME, p)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "apr_stat() failed");
+    }
+    else {
+        mtime = configFileInfo.mtime;
+    }
+    apr_pool_destroy(p);
+    return mtime;
 }
 
 /*_________________---------------------------__________________
@@ -706,17 +664,16 @@ static void sfwb_apply_config(SFWB *sm, SFWBConfig *config)
 */
         
 void sflow_tick(SFWB *sm) {
-    if(!sm->enabled) return;
-
     if(--sm->configCountDown <= 0) {
+        apr_time_t modTime = configModified(sm);
         sm->configCountDown = SFWB_CONFIG_CHECK_S;
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "checking for config file change <%s>", sm->configFile);
-        struct stat statBuf;
-        if(stat(sm->configFile, &statBuf) != 0) {
+
+        if(modTime == 0) {
             /* config file missing */
             sfwb_apply_config(sm, NULL);
         }
-        else if(statBuf.st_mtime != sm->configFile_modTime) {
+        else if(modTime != sm->configFile_modTime) {
             /* config file modified */
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "config file changed <%s>", sm->configFile);
             SFWBConfig *newConfig = sfwb_readConfig(sm);
@@ -724,7 +681,7 @@ void sflow_tick(SFWB *sm) {
                 /* config OK - apply it */
                 ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "config file OK <%s>", sm->configFile);
                 sfwb_apply_config(sm, newConfig);
-                sm->configFile_modTime = statBuf.st_mtime;
+                sm->configFile_modTime = modTime;
             }
             else {
                 /* bad config - ignore it (may be in transition) */
@@ -733,7 +690,7 @@ void sflow_tick(SFWB *sm) {
         }
     }
     
-    if(sm->agent && sm->configOK) {
+    if(sm->agent && sm->config) {
         sfl_agent_tick(sm->agent, sm->currentTime);
     }
 }
@@ -745,7 +702,7 @@ void sflow_tick(SFWB *sm) {
 
 static void sflow_init(SFWB *sm)
 {
-
+    int rc;
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: sFlow=%p pid=%u config=%p",
                  (void *)sm,
                  getpid(),
@@ -755,33 +712,34 @@ static void sflow_init(SFWB *sm)
         sm->configFile = SFWB_DEFAULT_CONFIGFILE;
     }
 
-    if(!sm->configOK) return;
+    if(sm->config == NULL) return;
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: building sFlow agent");
 
     {
-        /* create/re-create the agent */
+        /* create or re-create the agent */
         if(sm->agent) {
             sfl_agent_release(sm->agent);
             apr_pool_clear(sm->masterPool);
+            sm->socket4 = NULL;
+            sm->socket6 = NULL;
         }
 
         sm->agent = (SFLAgent *)apr_pcalloc(sm->masterPool, sizeof(SFLAgent));
 
-        /* open the sockets - one for v4 and another for v6  - should these
-         * be registered with the pool? $$$ */
-        if(sm->socket4 <= 0) {
-            if((sm->socket4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
-                ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "IPv4 send socket open failed");
+        /* open the send sockets - one for v4 and another for v6 */
+        if(!sm->socket4) {
+            if((rc = apr_socket_create(&sm->socket4, APR_INET, SOCK_DGRAM, APR_PROTO_UDP, sm->masterPool)) != APR_SUCCESS)
+                ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "IPv4 send socket open failed");
         }
-        if(sm->socket6 <= 0) {
-            if((sm->socket6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) == -1)
-                ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "IPv6 send socket open failed");
+        if(!sm->socket6) {
+            if((rc = apr_socket_create(&sm->socket6, APR_INET6, SOCK_DGRAM, APR_PROTO_UDP, sm->masterPool)) != APR_SUCCESS)
+                ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "IPv6 send socket open failed");
         }
         
         /* initialize the agent with it's address, bootime, callbacks etc. */
         sfl_agent_init(sm->agent,
-                       &sm->config.agentIP,
+                       &sm->config->agentIP,
                        getpid(), /* subAgentId */
                        sm->currentTime,
                        sm->currentTime,
@@ -807,18 +765,18 @@ static void sflow_init(SFWB *sm)
           
         /* add a poller for the counters */
         sm->poller = sfl_agent_addPoller(sm->agent, &dsi, sm, sfwb_cb_counters);
-        sfl_poller_set_sFlowCpInterval(sm->poller, sm->config.polling_secs);
+        sfl_poller_set_sFlowCpInterval(sm->poller, sm->config->polling_secs);
         sfl_poller_set_sFlowCpReceiver(sm->poller, 1 /* receiver index == 1 */);
         
         /* add a sampler for the sampled operations */
         sm->sampler = sfl_agent_addSampler(sm->agent, &dsi);
-        sfl_sampler_set_sFlowFsPacketSamplingRate(sm->sampler, sm->config.sampling_n);
+        sfl_sampler_set_sFlowFsPacketSamplingRate(sm->sampler, sm->config->sampling_n);
         sfl_sampler_set_sFlowFsReceiver(sm->sampler, 1 /* receiver index == 1 */);
         
-        if(sm->config.sampling_n) {
+        if(sm->config->sampling_n) {
             /* IPC to the child processes */
             SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
-            shared->sflow_skip = sm->config.sampling_n;
+            shared->sflow_skip = sm->config->sampling_n;
         }
     }
 }
@@ -963,13 +921,18 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 {
     int rc;
     SFWB *sm = apr_pcalloc(p, sizeof(SFWB));
+#ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "create_sflow_config - pid=%u,tid=%u\n", getpid(), MYGETTID);
+#endif
     sm->configFile = SFWB_DEFAULT_CONFIGFILE;
-    sm->enabled = true; /* could be controlled by config cmd (see below) */
 
     /* a pool to use for the agent so we can recycle the memory easily on a config change */
     if((rc = apr_pool_create(&sm->masterPool, p)) != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "create_sflow_config: error creating sub-pool");
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "create_sflow_config: error creating master agent sub-pool");
+    }
+    /* a pool to use for the config so we can allocate apr_sockaddr_t objects */
+    if((rc = apr_pool_create(&sm->configPool, p)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "create_sflow_config: error creating config sub-pool");
     }
     return sm;
 }
@@ -983,10 +946,10 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 {
     void *flag;
     SFWB *sm = GET_CONFIG_DATA(s);
-    int rc;
-    int mpm_threaded = 0;
 
+#ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u\n", getpid(),MYGETTID);
+#endif
 
     /* All post_config hooks are called twice, we're only interested in the second call. */
     apr_pool_userdata_get(&flag, MOD_SFLOW_USERDATA_KEY, s->process->pool);
@@ -995,17 +958,21 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         return OK;
     }
 
-    if((rc = ap_mpm_query(AP_MPMQ_IS_THREADED, &mpm_threaded)) == APR_SUCCESS) {
-        /* We could perhaps use this information to decided whether to create the mutex in each child */
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u\n", mpm_threaded);
-    }
-    else {
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed\n");
-    }
-
-
-    if(sm && sm->enabled && sm->sFlowProc == NULL) {
-        start_sflow_master(p, s, sm);
+    if(sm) {
+        
+#ifdef SFWB_DEBUG
+        if((rc = ap_mpm_query(AP_MPMQ_IS_THREADED, &sm->mpm_threaded)) == APR_SUCCESS) {
+            /* We could use this information to decided whether to create the mutex in each child */
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u\n", sm->mpm_threaded);
+        }
+        else {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed\n");
+        }
+#endif
+        
+        if(sm->sFlowProc == NULL) {
+            start_sflow_master(p, s, sm);
+        }
     }
     return OK;
 }
@@ -1039,9 +1006,11 @@ static void sfwb_childcb_error(void *magic, SFLAgent *agent, char *msg)
 
 static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
+    int rc;
     SFWB *sm = GET_CONFIG_DATA(s);
-    if(!sm->enabled) return;
+#ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u\n", getpid(),MYGETTID);
+#endif
     /* create my own private state, and hang it off the shared state */
     SFWBChild *child = (SFWBChild *)apr_pcalloc(p, sizeof(SFWBChild));
     sm->child = child;
@@ -1051,14 +1020,20 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
     /* shared_mem base address - may be different for each child, so put in private state */
     child->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem);
 
-    /* a mutex to allow worker threads in the same child process to avoid tripping over each other */
     if(child->mutex == NULL) {
-        child->mutex = (pthread_mutex_t*)apr_pcalloc(p, sizeof(pthread_mutex_t));
-        pthread_mutex_init(child->mutex, NULL);
+        /* Create a mutex to allow worker threads in the same child process to share state */
+
+        /* this mutex may not be necessary if (sm->mpm_threaded==false), but the overhead is
+           low and we want the mutex code to be excercised and tested so just create one every time
+           whether it is needed or not. */
+
+        if((rc = apr_thread_mutex_create(&child->mutex, APR_THREAD_MUTEX_DEFAULT, p)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_init_child - apr_thread_mutex_create() failed\n");
+        }
     }
 
     /* create my own sFlow agent+sampler+receiver just so I can use it to encode XDR messages */
-    /* before sending them down the pipe */
+    /* before sending them on the pipe */
     child->agent = (SFLAgent *)apr_pcalloc(p, sizeof(SFLAgent));
     SFLAddress myIP = { 0 }; /* blank address */
     sfl_agent_init(child->agent,
@@ -1173,13 +1148,12 @@ static int sflow_multi_log_transaction(request_rec *r)
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)\n", child->sampler->skip);
     uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
 
-    /* For now, just lock this whole step.  Most times through here we do very little anyway.
-       It looks like we should switch to a probabililty-test for the sampling rather than a
-       countdown, since that would make it easier to only lock the mutex when we are actually taking
-       a sample.  It may also be necessary to change the counter/sample-pool accumulation so that
-       the shared counters only ever increment and the delta is calculated when we send the latest
-       counters.  Otherwise the clearing of the counters when we take a sample would require that
-       we lock just to increment them here,  even if we use apr_atomic_inc32() to do it? */
+    /* The simplest thing here is just to mutex-lock this whole step.
+       Most times through here we do very little anyway.  The alternative
+       would be to use atomic operations for the increments/decrements/tests that
+       we do every time, and only grab the mutex when we decide to take a sample,
+       but it's not clear if that would help or not.  It could easily end up
+       costing more. */
     lockOrDie(child->mutex);
 
     SFLHTTP_counters *ctrs = &child->http_counters.counterBlock.http;
@@ -1316,31 +1290,32 @@ static int sflow_handler(request_rec *r)
     if (strcmp(r->handler, "sflow")) {
         return DECLINED;
     }
-    r->content_type = "text/html";      
+    r->content_type = "text/plain";      
 
     if (!r->header_only) {
         if(r->server) {
             SFWB *sm = GET_CONFIG_DATA(r->server);
             if(sm) {
                 SFWBShared *shared = (SFWBShared *)sm->child->shared_mem_base;
-                ap_rprintf(r, "counter method_option_count %u<br />\n", shared->http_counters.counterBlock.http.method_option_count);
-                ap_rprintf(r, "counter method_get_count %u<br />\n", shared->http_counters.counterBlock.http.method_get_count);
-                ap_rprintf(r, "counter method_head_count %u<br />\n", shared->http_counters.counterBlock.http.method_head_count);
-                ap_rprintf(r, "counter method_post_count %u<br />\n", shared->http_counters.counterBlock.http.method_post_count);
-                ap_rprintf(r, "counter method_put_count %u<br />\n", shared->http_counters.counterBlock.http.method_put_count);
-                ap_rprintf(r, "counter method_delete_count %u<br />\n", shared->http_counters.counterBlock.http.method_delete_count);
-                ap_rprintf(r, "counter method_trace_count %u<br />\n", shared->http_counters.counterBlock.http.method_trace_count);
-                ap_rprintf(r, "counter method_connect_count %u<br />\n", shared->http_counters.counterBlock.http.method_connect_count);
-                ap_rprintf(r, "counter method_other_count %u<br />\n", shared->http_counters.counterBlock.http.method_other_count);
-                ap_rprintf(r, "counter status_1XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_1XX_count);
-                ap_rprintf(r, "counter status_2XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_2XX_count);
-                ap_rprintf(r, "counter status_3XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_3XX_count);
-                ap_rprintf(r, "counter status_4XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_4XX_count);
-                ap_rprintf(r, "counter status_5XX_count %u<br />\n", shared->http_counters.counterBlock.http.status_5XX_count);
-                ap_rprintf(r, "counter status_other_count %u<br />\n", shared->http_counters.counterBlock.http.status_other_count);
+                /* aligned 32-bit reads.  Assume atomic.  No locking required */
+                ap_rprintf(r, "counter method_option_count %u\n", shared->http_counters.counterBlock.http.method_option_count);
+                ap_rprintf(r, "counter method_get_count %u\n", shared->http_counters.counterBlock.http.method_get_count);
+                ap_rprintf(r, "counter method_head_count %u\n", shared->http_counters.counterBlock.http.method_head_count);
+                ap_rprintf(r, "counter method_post_count %u\n", shared->http_counters.counterBlock.http.method_post_count);
+                ap_rprintf(r, "counter method_put_count %u\n", shared->http_counters.counterBlock.http.method_put_count);
+                ap_rprintf(r, "counter method_delete_count %u\n", shared->http_counters.counterBlock.http.method_delete_count);
+                ap_rprintf(r, "counter method_trace_count %u\n", shared->http_counters.counterBlock.http.method_trace_count);
+                ap_rprintf(r, "counter method_connect_count %u\n", shared->http_counters.counterBlock.http.method_connect_count);
+                ap_rprintf(r, "counter method_other_count %u\n", shared->http_counters.counterBlock.http.method_other_count);
+                ap_rprintf(r, "counter status_1XX_count %u\n", shared->http_counters.counterBlock.http.status_1XX_count);
+                ap_rprintf(r, "counter status_2XX_count %u\n", shared->http_counters.counterBlock.http.status_2XX_count);
+                ap_rprintf(r, "counter status_3XX_count %u\n", shared->http_counters.counterBlock.http.status_3XX_count);
+                ap_rprintf(r, "counter status_4XX_count %u\n", shared->http_counters.counterBlock.http.status_4XX_count);
+                ap_rprintf(r, "counter status_5XX_count %u\n", shared->http_counters.counterBlock.http.status_5XX_count);
+                ap_rprintf(r, "counter status_other_count %u\n", shared->http_counters.counterBlock.http.status_other_count);
                 /* extra info */
-                ap_rprintf(r, "string hostname %s<br />\n", r->hostname);
-                ap_rprintf(r, "gauge sampling_n %u<br />\n", shared->sflow_skip);
+                ap_rprintf(r, "string hostname %s\n", r->hostname);
+                ap_rprintf(r, "gauge sampling_n %u\n", shared->sflow_skip);
             }
         }
     }
