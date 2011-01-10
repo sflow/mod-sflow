@@ -807,10 +807,6 @@ static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u\n", getpid());
     apr_status_t rc;
     
-    /* The pipe must be non-blocking to ensure that worker-threads never block on write.
-       setting the "timeout" to 0 seems to be equivalent to setting O_NONBLOCK? */
-    apr_file_pipe_timeout_set(sm->pipe_read, 0);
-    
     /* with the pipe in non-blocking mode, we now poll it's descriptor with a timeout */
 
     /* I don't see any functions for assembling an apr_pollfd_t object,
@@ -919,6 +915,11 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
         ap_log_error(APLOG_MARK, APLOG_ERR, status, s, "apr_file_pipe_create() failed");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
+    
+    /* The pipe must be non-blocking to ensure that worker-threads never block on write.
+       setting the "timeout" to 0 seems to be equivalent to setting O_NONBLOCK? */
+    apr_file_pipe_timeout_set(sm->pipe_read, 0);
+    apr_file_pipe_timeout_set(sm->pipe_write, 0);
 
     /* create anonymous shared memory for the sFlow agent structures and packet buffer */
     sm->shared_bytes_total = sizeof(SFWBShared);
