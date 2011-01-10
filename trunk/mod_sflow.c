@@ -895,7 +895,7 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             }
         }
     }
-    return 0;
+    return APR_SUCCESS;
 }
 
 
