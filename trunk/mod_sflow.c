@@ -802,95 +802,95 @@ static void sflow_init(SFWB *sm)
   -----------------___________________________------------------
 */
 
-static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
+static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 {
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u\n", getpid());
     apr_status_t rc;
-    
-    /* with the pipe in non-blocking mode, we now poll it's descriptor with a timeout */
 
-    /* I don't see any functions for assembling an apr_pollfd_t object,
-       so just build it manually. */
-    apr_pollfd_t *my_pollfd = apr_pcalloc(p, sizeof(apr_pollfd_t));
-    my_pollfd->desc_type = APR_POLL_FILE;
-    my_pollfd->desc.f = sm->pipe_read;
-    my_pollfd->reqevents = APR_POLLIN;
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u\n", getpid());
     
-    /* There's only one, so we can just use apr_poll, rather than build a pollset */
-    /*     apr_pollset_t *my_pollset = NULL; */
-    /*     rc = apr_pollset_create(&my_pollset, 1, p, 0); */
-    /*     ap_assert(rc == APR_SUCCESS); */
-    /*     rc = apr_pollset_add(my_pollset, &my_pollfd); */
-    /*     ap_assert(rc == APR_SUCCESS); */
+    /* read with timeout just under a second so that the sflow_tick can be issued every second.*/
+    if((rc = apr_file_pipe_timeout_set(sm->pipe_read, 900000 /* uS */)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_file_pipe_timeout_set() failed");
+        return rc;
+    }
 
     /* now loop forever */
     for(;;) {
+
+        /* send ticks */
         apr_time_t now = apr_time_sec(apr_time_now());
         if(sm->currentTime != now) {
             sflow_tick(sm);
             sm->currentTime = now;
         }
-        apr_int32_t nsds = 0;
-        /* poll with timeout just under a second so that the sflow_tick can be issued every second.*/
-        rc = apr_poll(my_pollfd, 1, &nsds, 900000 /* in uS */);
-        ap_assert(rc == APR_SUCCESS || APR_STATUS_IS_TIMEUP(rc));
-        if(rc == APR_SUCCESS && my_pollfd->rtnevents > 0) {
-            uint32_t msg[PIPE_BUF / sizeof(uint32_t)];
-            /* just read the length and type first */
-            size_t hdrBytes = 12;
-            size_t hdrBytesRead = 0;
-            rc = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
-            if(rc == APR_SUCCESS && hdrBytesRead != 0) {
-                ap_assert(hdrBytesRead == hdrBytes);
-                /* now read the rest */
-                size_t msgBytes = msg[0];
-                uint32_t msgType = msg[1];
-                uint32_t msgId = msg[2];
-                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - msgType/id = %u/%u msgBytes=%u\n",
-                             msgType,
-                             msgId,
-                             msgBytes);
-                ap_assert(msgType == SFLCOUNTERS_SAMPLE || msgType == SFLFLOW_SAMPLE);
-                ap_assert(msgBytes <= PIPE_BUF);
-                size_t bodyBytes = msgBytes - hdrBytes;
-                size_t bodyBytesRead = 0;
-                rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead);
-                ap_assert(rc == APR_SUCCESS);
-                ap_assert(bodyBytesRead == bodyBytes);
-                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - bodyBytes read=%u\n", bodyBytesRead);
-                /* we may not have initialized the agent yet,  so the first few samples may end up being ignored */
-                if(sm->sampler) {
-                    uint32_t *datap = msg;
-                    if(msgType == SFLCOUNTERS_SAMPLE && msgId == SFLCOUNTERS_HTTP) {
-                        /* counter block */
-                        SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
-                        SFLHTTP_counters c;
-                        memcpy(&c, datap, sizeof(c));
-                        /* accumulate into my total */
-                        shared->http_counters.counterBlock.http.method_option_count += c.method_option_count;
-                        shared->http_counters.counterBlock.http.method_get_count += c.method_get_count;
-                        shared->http_counters.counterBlock.http.method_head_count += c.method_head_count;
-                        shared->http_counters.counterBlock.http.method_post_count += c.method_post_count;
-                        shared->http_counters.counterBlock.http.method_put_count += c.method_put_count;
-                        shared->http_counters.counterBlock.http.method_delete_count += c.method_delete_count;
-                        shared->http_counters.counterBlock.http.method_trace_count += c.method_trace_count;
-                        shared->http_counters.counterBlock.http.method_connect_count += c.method_connect_count;
-                        shared->http_counters.counterBlock.http.method_other_count += c.method_other_count;
-                        shared->http_counters.counterBlock.http.status_1XX_count += c.status_1XX_count;
-                        shared->http_counters.counterBlock.http.status_2XX_count += c.status_2XX_count;
-                        shared->http_counters.counterBlock.http.status_3XX_count += c.status_3XX_count;
-                        shared->http_counters.counterBlock.http.status_4XX_count += c.status_4XX_count;
-                        shared->http_counters.counterBlock.http.status_5XX_count += c.status_5XX_count;
-                        shared->http_counters.counterBlock.http.status_other_count += c.status_other_count;
-                    }
-                    else if(msgType == SFLFLOW_SAMPLE && msgId == SFLFLOW_HTTP) {
-                        sm->sampler->samplePool += *datap++;
-                        sm->sampler->dropEvents += *datap++;
-                        /* next we have a flow sample that we can encode straight into the output,  but we have to put it */
-                        /* through our sampler object so that we get the right sequence numbers, pools and data-source ids. */
-                        uint32_t sampleBytes = (msg + (bodyBytesRead>>2) - datap) << 2;
-                        sfl_sampler_writeEncodedFlowSample(sm->sampler, (char *)datap, sampleBytes);
-                    }
+
+        /* read a message from the pipe (or time out) */
+        uint32_t msg[PIPE_BUF / sizeof(uint32_t)];
+
+        /* just read the length and type first */
+        size_t hdrBytes = 12;
+        size_t hdrBytesRead = 0;
+        rc = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
+        if(rc != APR_SUCCESS && !(APR_STATUS_IS_TIMEUP(rc))) {
+            ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
+            return rc;
+        }
+
+        if(rc == APR_SUCCESS && hdrBytesRead != 0) {
+            ap_assert(hdrBytesRead == hdrBytes);
+            /* now read the rest */
+            size_t msgBytes = msg[0];
+            uint32_t msgType = msg[1];
+            uint32_t msgId = msg[2];
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - msgType/id = %u/%u msgBytes=%u\n",
+                         msgType,
+                         msgId,
+                         msgBytes);
+            ap_assert(msgType == SFLCOUNTERS_SAMPLE || msgType == SFLFLOW_SAMPLE);
+            ap_assert(msgBytes <= PIPE_BUF);
+            size_t bodyBytes = msgBytes - hdrBytes;
+            size_t bodyBytesRead = 0;
+            if((rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead)) != APR_SUCCESS) {
+                ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
+                return rc;
+            }
+
+            ap_assert(rc == APR_SUCCESS);
+            ap_assert(bodyBytesRead == bodyBytes);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - bodyBytes read=%u\n", bodyBytesRead);
+
+            /* we may not have initialized the agent yet,  so the first few samples may end up being ignored */
+            if(sm->sampler) {
+                uint32_t *datap = msg;
+                if(msgType == SFLCOUNTERS_SAMPLE && msgId == SFLCOUNTERS_HTTP) {
+                    /* counter block */
+                    SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
+                    SFLHTTP_counters c;
+                    memcpy(&c, datap, sizeof(c));
+                    /* accumulate into my total */
+                    shared->http_counters.counterBlock.http.method_option_count += c.method_option_count;
+                    shared->http_counters.counterBlock.http.method_get_count += c.method_get_count;
+                    shared->http_counters.counterBlock.http.method_head_count += c.method_head_count;
+                    shared->http_counters.counterBlock.http.method_post_count += c.method_post_count;
+                    shared->http_counters.counterBlock.http.method_put_count += c.method_put_count;
+                    shared->http_counters.counterBlock.http.method_delete_count += c.method_delete_count;
+                    shared->http_counters.counterBlock.http.method_trace_count += c.method_trace_count;
+                    shared->http_counters.counterBlock.http.method_connect_count += c.method_connect_count;
+                    shared->http_counters.counterBlock.http.method_other_count += c.method_other_count;
+                    shared->http_counters.counterBlock.http.status_1XX_count += c.status_1XX_count;
+                    shared->http_counters.counterBlock.http.status_2XX_count += c.status_2XX_count;
+                    shared->http_counters.counterBlock.http.status_3XX_count += c.status_3XX_count;
+                    shared->http_counters.counterBlock.http.status_4XX_count += c.status_4XX_count;
+                    shared->http_counters.counterBlock.http.status_5XX_count += c.status_5XX_count;
+                    shared->http_counters.counterBlock.http.status_other_count += c.status_other_count;
+                }
+                else if(msgType == SFLFLOW_SAMPLE && msgId == SFLFLOW_HTTP) {
+                    sm->sampler->samplePool += *datap++;
+                    sm->sampler->dropEvents += *datap++;
+                    /* next we have a flow sample that we can encode straight into the output,  but we have to put it */
+                    /* through our sampler object so that we get the right sequence numbers, pools and data-source ids. */
+                    uint32_t sampleBytes = (msg + (bodyBytesRead>>2) - datap) << 2;
+                    sfl_sampler_writeEncodedFlowSample(sm->sampler, (char *)datap, sampleBytes);
                 }
             }
         }
@@ -905,38 +905,39 @@ static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 */
 
 static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
-    apr_status_t status;
+    apr_status_t rc;
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master - pid=%u\n", getpid());
 
     /* create the pipe that the child processes will use to send samples to the master */
     /* wanted to use apr_file_pipe_create_ex(...APR_FULL_NONBLOCK..) but it seems to be a new addition */
-    if((status=apr_file_pipe_create(&sm->pipe_read, &sm->pipe_write, p)) != OK) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, status, s, "apr_file_pipe_create() failed");
+    if((rc = apr_file_pipe_create(&sm->pipe_read, &sm->pipe_write, p)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_file_pipe_create() failed");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
-    
-    /* The pipe must be non-blocking to ensure that worker-threads never block on write.
-       setting the "timeout" to 0 seems to be equivalent to setting O_NONBLOCK? */
-    apr_file_pipe_timeout_set(sm->pipe_read, 0);
+   
+    /* The write-end of the pipe must be non-blocking to ensure that worker-threads are never stalled. */
     apr_file_pipe_timeout_set(sm->pipe_write, 0);
 
     /* create anonymous shared memory for the sFlow agent structures and packet buffer */
     sm->shared_bytes_total = sizeof(SFWBShared);
-    if((status = apr_shm_create(&sm->shared_mem, sm->shared_bytes_total, NULL, p)) != OK) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, status, s, "apr_shm_create() failed");
+    if((rc = apr_shm_create(&sm->shared_mem, sm->shared_bytes_total, NULL, p)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_shm_create() failed");
         /* may return ENOTIMPL if anon shared mem not supported,  in which case we */
         /* should try again with a filename. $$$ */
         return HTTP_INTERNAL_SERVER_ERROR;
     }
-    sm->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem); /* each child must call again */
 
+    /* Remember the base address of this shared memory.  Each child must call again */
+    sm->shared_mem_base = apr_shm_baseaddr_get(sm->shared_mem);
+
+    /* initialze the counter block */
     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
     shared->http_counters.tag = SFLCOUNTERS_HTTP;
 
     sm->sFlowProc = apr_palloc(p, sizeof(apr_proc_t));
-    ap_assert(sm->sFlowProc);
-    switch(status = apr_proc_fork(sm->sFlowProc, p)) {
+
+    switch(rc = apr_proc_fork(sm->sFlowProc, p)) {
     case APR_INCHILD:
         /* close the write-end of the inherited pipe */
         apr_file_close(sm->pipe_write);
@@ -951,10 +952,11 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
         apr_pool_note_subprocess(p, sm->sFlowProc, APR_KILL_AFTER_TIMEOUT);
         break;
     default:
-        ap_log_error(APLOG_MARK, APLOG_ERR, status, s, "apr_fork() failed");
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_fork() failed");
         return HTTP_INTERNAL_SERVER_ERROR;
         break;
     }
+
     return OK;
 }
 
@@ -1105,7 +1107,7 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
     /* we'll pick up the sampling_rate later. Don't want to insist
      * on it being present at startup - don't want to delay the
      * startup if we can avoid it.  Just set it to 0 so we check for
-     * it. Otherwise it will start out as the default (400) */
+     * it. Otherwise it would have started out as the default (400) */
     sfl_sampler_set_sFlowFsPacketSamplingRate(child->sampler, 0);
 }
 
@@ -1245,6 +1247,7 @@ static int sflow_multi_log_transaction(request_rec *r)
         const char *referer = apr_table_get(r->headers_in, "Referer");
         const char *useragent = apr_table_get(r->headers_in, "User-Agent");
         const char *contentType = apr_table_get(r->headers_in, "Content-Type");
+
         /* encode the transaction sample next */
         sflow_sample_http(child->sampler,
                           r->connection,
@@ -1302,8 +1305,8 @@ static int sflow_multi_log_transaction(request_rec *r)
         /* write this in as the first 32-bit word */
         *msg = msgBytes;
 
-        /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen, */
-        /* but can't risk it, since we are relying on this as the synchronization mechanism */
+        /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen,
+           but can't risk it, since we are relying on this as the synchronization mechanism */
         if(msgBytes > PIPE_BUF) {
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
             /* this counts as an sFlow drop-event */
