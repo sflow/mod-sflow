@@ -40,13 +40,13 @@
 **  random sampling and XDR encoding.  (We have to serialize the data onto the
 **  pipe anyway so it makes sense to use the XDR encoding and take advantage
 **  of the library code to do that).  The "master" agent can simply copy
-**  the pre-encoded samples directly into the output packet.
+**  the pre-encoded samples directly into the output datagram.
 **
 **  mutual-exclusion
 **  ================
 **  Using a pipe here for the many-to-one child-to-master communication was
 **  convenient because writing to the pipe also provides mutual-exclusion
-**  between the different child process (since the messages are less that 4096
+**  between the different child process (when the messages are less that PIPE_BUF
 **  bytes the write() calls are guaranteed atomic).  To allow this module to
 **  work in servers with MPM=worker (as well as MPM=prefork) an additional mutex
 **  was used in each child process.  This allows multiple worker-threads to
@@ -63,6 +63,20 @@
 #include "http_protocol.h"
 #include "http_log.h"
 
+/* make sure we have a value for PIPE_BUF, the max
+   size of an atomic write on a pipe. Currently Linux
+   has 4096, Solaris has 5120, OSX/FreeBSD has 512.
+   _POSIX_PIPE_BUF sets the minimum to be 512.  We
+   are unlikely to hit even that given the current
+   sFlow HTTP spec, so fall back on 512 if all else
+   fails. */
+#ifdef APR_HAVE_LIMITS_H
+#include <limits.h>
+#endif
+#ifndef PIPE_BUF
+#define PIPE_BUF 512
+#endif
+
 /* sFlow library */
 #include "sflow_api.h"
 
@@ -75,7 +89,7 @@
 /* #include <stdbool.h> */
 #define true 1
 #define false 0
-typedef u_int8_t bool;
+typedef uint8_t bool;
 
 /*_________________---------------------------__________________
   _________________   module config data      __________________
@@ -790,66 +804,95 @@ static void sflow_init(SFWB *sm)
 static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 {
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u\n", getpid());
+    apr_status_t rc;
+    
+    /* The pipe must be non-blocking to ensure that worker-threads never block on write.
+       setting the "timeout" to 0 seems to be equivalent to setting O_NONBLOCK? */
+    apr_file_pipe_timeout_set(sm->pipe_read, 0);
+    
+    /* with the pipe in non-blocking mode, we now poll it's descriptor with a timeout */
 
-    apr_file_pipe_timeout_set(sm->pipe_read, 1000000); /* uS */
+    /* I don't see any functions for assembling an apr_pollfd_t object,
+       so just build it manually. */
+    apr_pollfd_t *my_pollfd = apr_pcalloc(p, sizeof(apr_pollfd_t));
+    my_pollfd->desc_type = APR_POLL_FILE;
+    my_pollfd->desc.f = sm->pipe_read;
+    my_pollfd->reqevents = APR_POLLIN;
+    
+    /* There's only one, so we can just use apr_poll, rather than build a pollset */
+    /*     apr_pollset_t *my_pollset = NULL; */
+    /*     rc = apr_pollset_create(&my_pollset, 1, p, 0); */
+    /*     ap_assert(rc == APR_SUCCESS); */
+    /*     rc = apr_pollset_add(my_pollset, &my_pollfd); */
+    /*     ap_assert(rc == APR_SUCCESS); */
+
+    /* now loop forever */
     for(;;) {
-        sm->currentTime = apr_time_sec(apr_time_now());
-        sflow_tick(sm);
-        uint32_t msg[4096>>2];
-        /* just read the length and type first */
-        size_t hdrBytes = 12;
-        size_t hdrBytesRead = 0;
-        apr_status_t rv = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
-        if(rv == APR_SUCCESS && hdrBytesRead != 0) {
-            ap_assert(hdrBytesRead == hdrBytes);
-            /* now read the rest */
-            size_t msgBytes = msg[0];
-            uint32_t msgType = msg[1];
-            uint32_t msgId = msg[2];
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - msgType/id = %u/%u msgBytes=%u\n",
-                         msgType,
-                         msgId,
-                         msgBytes);
-            ap_assert(msgType == SFLCOUNTERS_SAMPLE || msgType == SFLFLOW_SAMPLE);
-            ap_assert(msgBytes <= 4096);
-            size_t bodyBytes = msgBytes - hdrBytes;
-            size_t bodyBytesRead = 0;
-            rv = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead);
-            ap_assert(rv == APR_SUCCESS);
-            ap_assert(bodyBytesRead == bodyBytes);
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - bodyBytes read=%u\n", bodyBytesRead);
-            /* we may not have initialized the agent yet,  so the first few samples may end up being ignored */
-            if(sm->sampler) {
-                uint32_t *datap = msg;
-                if(msgType == SFLCOUNTERS_SAMPLE && msgId == SFLCOUNTERS_HTTP) {
-                    /* counter block */
-                    SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
-                    SFLHTTP_counters c;
-                    memcpy(&c, datap, sizeof(c));
-                    /* accumulate into my total */
-                    shared->http_counters.counterBlock.http.method_option_count += c.method_option_count;
-                    shared->http_counters.counterBlock.http.method_get_count += c.method_get_count;
-                    shared->http_counters.counterBlock.http.method_head_count += c.method_head_count;
-                    shared->http_counters.counterBlock.http.method_post_count += c.method_post_count;
-                    shared->http_counters.counterBlock.http.method_put_count += c.method_put_count;
-                    shared->http_counters.counterBlock.http.method_delete_count += c.method_delete_count;
-                    shared->http_counters.counterBlock.http.method_trace_count += c.method_trace_count;
-                    shared->http_counters.counterBlock.http.method_connect_count += c.method_connect_count;
-                    shared->http_counters.counterBlock.http.method_other_count += c.method_other_count;
-                    shared->http_counters.counterBlock.http.status_1XX_count += c.status_1XX_count;
-                    shared->http_counters.counterBlock.http.status_2XX_count += c.status_2XX_count;
-                    shared->http_counters.counterBlock.http.status_3XX_count += c.status_3XX_count;
-                    shared->http_counters.counterBlock.http.status_4XX_count += c.status_4XX_count;
-                    shared->http_counters.counterBlock.http.status_5XX_count += c.status_5XX_count;
-                    shared->http_counters.counterBlock.http.status_other_count += c.status_other_count;
-                }
-                else if(msgType == SFLFLOW_SAMPLE && msgId == SFLFLOW_HTTP) {
-                    sm->sampler->samplePool += *datap++;
-                    sm->sampler->dropEvents += *datap++;
-                    /* next we have a flow sample that we can encode straight into the output,  but we have to put it */
-                    /* through our sampler object so that we get the right sequence numbers, pools and data-source ids. */
-                    uint32_t sampleBytes = (msg + (bodyBytesRead>>2) - datap) << 2;
-                    sfl_sampler_writeEncodedFlowSample(sm->sampler, (char *)datap, sampleBytes);
+        apr_time_t now = apr_time_sec(apr_time_now());
+        if(sm->currentTime != now) {
+            sflow_tick(sm);
+            sm->currentTime = now;
+        }
+        apr_int32_t nsds = 0;
+        /* poll with timeout just under a second so that the sflow_tick can be issued every second.*/
+        rc = apr_poll(my_pollfd, 1, &nsds, 900000 /* in uS */);
+        if(rc == APR_SUCCESS && my_pollfd->rtnevents > 0) {
+            uint32_t msg[PIPE_BUF / sizeof(uint32_t)];
+            /* just read the length and type first */
+            size_t hdrBytes = 12;
+            size_t hdrBytesRead = 0;
+            rc = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
+            if(rc == APR_SUCCESS && hdrBytesRead != 0) {
+                ap_assert(hdrBytesRead == hdrBytes);
+                /* now read the rest */
+                size_t msgBytes = msg[0];
+                uint32_t msgType = msg[1];
+                uint32_t msgId = msg[2];
+                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - msgType/id = %u/%u msgBytes=%u\n",
+                             msgType,
+                             msgId,
+                             msgBytes);
+                ap_assert(msgType == SFLCOUNTERS_SAMPLE || msgType == SFLFLOW_SAMPLE);
+                ap_assert(msgBytes <= PIPE_BUF);
+                size_t bodyBytes = msgBytes - hdrBytes;
+                size_t bodyBytesRead = 0;
+                rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead);
+                ap_assert(rc == APR_SUCCESS);
+                ap_assert(bodyBytesRead == bodyBytes);
+                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - bodyBytes read=%u\n", bodyBytesRead);
+                /* we may not have initialized the agent yet,  so the first few samples may end up being ignored */
+                if(sm->sampler) {
+                    uint32_t *datap = msg;
+                    if(msgType == SFLCOUNTERS_SAMPLE && msgId == SFLCOUNTERS_HTTP) {
+                        /* counter block */
+                        SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
+                        SFLHTTP_counters c;
+                        memcpy(&c, datap, sizeof(c));
+                        /* accumulate into my total */
+                        shared->http_counters.counterBlock.http.method_option_count += c.method_option_count;
+                        shared->http_counters.counterBlock.http.method_get_count += c.method_get_count;
+                        shared->http_counters.counterBlock.http.method_head_count += c.method_head_count;
+                        shared->http_counters.counterBlock.http.method_post_count += c.method_post_count;
+                        shared->http_counters.counterBlock.http.method_put_count += c.method_put_count;
+                        shared->http_counters.counterBlock.http.method_delete_count += c.method_delete_count;
+                        shared->http_counters.counterBlock.http.method_trace_count += c.method_trace_count;
+                        shared->http_counters.counterBlock.http.method_connect_count += c.method_connect_count;
+                        shared->http_counters.counterBlock.http.method_other_count += c.method_other_count;
+                        shared->http_counters.counterBlock.http.status_1XX_count += c.status_1XX_count;
+                        shared->http_counters.counterBlock.http.status_2XX_count += c.status_2XX_count;
+                        shared->http_counters.counterBlock.http.status_3XX_count += c.status_3XX_count;
+                        shared->http_counters.counterBlock.http.status_4XX_count += c.status_4XX_count;
+                        shared->http_counters.counterBlock.http.status_5XX_count += c.status_5XX_count;
+                        shared->http_counters.counterBlock.http.status_other_count += c.status_other_count;
+                    }
+                    else if(msgType == SFLFLOW_SAMPLE && msgId == SFLFLOW_HTTP) {
+                        sm->sampler->samplePool += *datap++;
+                        sm->sampler->dropEvents += *datap++;
+                        /* next we have a flow sample that we can encode straight into the output,  but we have to put it */
+                        /* through our sampler object so that we get the right sequence numbers, pools and data-source ids. */
+                        uint32_t sampleBytes = (msg + (bodyBytesRead>>2) - datap) << 2;
+                        sfl_sampler_writeEncodedFlowSample(sm->sampler, (char *)datap, sampleBytes);
+                    }
                 }
             }
         }
@@ -876,7 +919,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     }
 
     /* create anonymous shared memory for the sFlow agent structures and packet buffer */
-    sm->shared_bytes_total = 4096; /* sizeof(SFWBShared); */
+    sm->shared_bytes_total = sizeof(SFWBShared);
     if((status = apr_shm_create(&sm->shared_mem, sm->shared_bytes_total, NULL, p)) != OK) {
         ap_log_error(APLOG_MARK, APLOG_ERR, status, s, "apr_shm_create() failed");
         /* may return ENOTIMPL if anon shared mem not supported,  in which case we */
@@ -1218,10 +1261,10 @@ static int sflow_multi_log_transaction(request_rec *r)
         uint32_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
         /* write this in as the first 32-bit word */
         *msg = msgBytes;
-        /* if greater than 4096 the pipe write will not be atomic. Should never happen, */
-        /* but can't risk it, since we are relying on this as the synchronization mechanism */
-        if(msgBytes > 4096) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds 4096-byte limit for atomic write", msgBytes);
+        /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen, */
+        /* but can't risk it, since we are relying on this as the synchronization mechanism. */
+        if(msgBytes > PIPE_BUF) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
             /* this counts as an sFlow drop-event */
             child->sampler->dropEvents++;
         }
@@ -1254,10 +1297,10 @@ static int sflow_multi_log_transaction(request_rec *r)
         /* write this in as the first 32-bit word */
         *msg = msgBytes;
 
-        /* if greater than 4096 the pipe write will not be atomic. Should never happen, */
+        /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen, */
         /* but can't risk it, since we are relying on this as the synchronization mechanism */
-        if(msgBytes > 4096) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds 4096-byte limit for atomic write", msgBytes);
+        if(msgBytes > PIPE_BUF) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
             /* this counts as an sFlow drop-event */
             child->sampler->dropEvents++;
         }
