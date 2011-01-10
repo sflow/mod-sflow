@@ -32,6 +32,37 @@ Configuration
 
   http://host-sflow.sourceforge.net
 
+  Optionally,  you can also install a handler that will return the
+  latest counter values.  This goes into your httpd.conf file,  or
+  in a separate file .../httpd/conf.d/sflow.conf:
+
+    <IfModule mod_sflow.c>
+      <Location /sflow>
+        SetHandler sflow
+      </Location>
+    </IfModule>
+
+  After restarting apache again, you should now be able to visit
+  http://<server>/sflow/ and see text/plain output like this:
+
+    counter method_option_count 0
+    counter method_get_count 34
+    counter method_head_count 0
+    counter method_post_count 0
+    counter method_put_count 0
+    counter method_delete_count 0
+    counter method_trace_count 0
+    counter method_connect_count 0
+    counter method_other_count 0
+    counter status_1XX_count 0
+    counter status_2XX_count 17
+    counter status_3XX_count 0
+    counter status_4XX_count 17
+    counter status_5XX_count 0
+    counter status_other_count 0
+    string hostname 10.0.0.119
+    gauge sampling_n 400
+
 Output
 ======
 
