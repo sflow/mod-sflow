@@ -415,7 +415,8 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
                 SFLADD_ELEMENT(&fs, &socElem);
             }
             else {
-                ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "unexpected socket length or address family");
+                /* something odd here - don't add the socElem. We can still send the sample below */
+                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "unexpected socket length or address family");
             }
         }
     }
@@ -1265,14 +1266,16 @@ static int sflow_multi_log_transaction(request_rec *r)
         /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen, */
         /* but can't risk it, since we are relying on this as the synchronization mechanism. */
         if(msgBytes > PIPE_BUF) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
             /* this counts as an sFlow drop-event */
             child->sampler->dropEvents++;
         }
         else {
             apr_size_t msgBytes2 = (apr_size_t)msgBytes;
             if(apr_file_write_full(sm->pipe_write, msg, msgBytes2, &msgBytes2) != APR_SUCCESS) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
+                /* this can happen if the pipe is full - e.g. under high load conditions with
+                   agressive sampling.  The pipe is non-blocking so we'll get EAGAIN or EWOULDBLOCK */
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "error in apr_file_write_full()\n");
                 /* this counts as an sFlow drop-event */
                 child->sampler->dropEvents++;
             }
@@ -1301,14 +1304,16 @@ static int sflow_multi_log_transaction(request_rec *r)
         /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen, */
         /* but can't risk it, since we are relying on this as the synchronization mechanism */
         if(msgBytes > PIPE_BUF) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
             /* this counts as an sFlow drop-event */
             child->sampler->dropEvents++;
         }
         else {
             apr_size_t msgBytes2 = (apr_size_t)msgBytes;
             if(apr_file_write_full(sm->pipe_write, msg, msgBytes2, &msgBytes2) != APR_SUCCESS) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "error in apr_file_write_full()\n");
+                /* this can happen if the pipe is full - e.g. under high load conditions with
+                   agressive sampling.  The pipe is non-blocking so we'll get EAGAIN or EWOULDBLOCK */
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "error in apr_file_write_full()\n");
                 /* this counts as an sFlow drop-event */
                 child->sampler->dropEvents++;
             }
