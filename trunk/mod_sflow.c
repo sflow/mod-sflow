@@ -836,6 +836,7 @@ static int run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         apr_int32_t nsds = 0;
         /* poll with timeout just under a second so that the sflow_tick can be issued every second.*/
         rc = apr_poll(my_pollfd, 1, &nsds, 900000 /* in uS */);
+        ap_assert(rc == APR_SUCCESS || APR_STATUS_IS_TIMEUP(rc));
         if(rc == APR_SUCCESS && my_pollfd->rtnevents > 0) {
             uint32_t msg[PIPE_BUF / sizeof(uint32_t)];
             /* just read the length and type first */
