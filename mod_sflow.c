@@ -89,7 +89,8 @@
 /* #include <stdbool.h> */
 #define true 1
 #define false 0
-typedef uint8_t bool;
+/* use 32-bits for boot_t to help avoid unaligned fields */
+typedef uint32_t bool_t;
 
 /*_________________---------------------------__________________
   _________________   module config data      __________________
@@ -143,8 +144,8 @@ typedef struct _SFWBConfig {
     int error;
     uint32_t sampling_n;
     uint32_t polling_secs;
-    bool got_sampling_n_http;
-    bool got_polling_secs_http;
+    bool_t got_sampling_n_http;
+    bool_t got_polling_secs_http;
     SFLAddress agentIP;
     uint32_t num_collectors;
     SFWBCollector collectors[SFWB_MAX_COLLECTORS];
@@ -154,6 +155,7 @@ typedef struct _SFWBConfig {
 
 typedef struct _SFWBChild {
     apr_thread_mutex_t *mutex;
+    bool_t sflow_disabled;
     void *shared_mem_base; /* may be a different address for each worker */
     SFLAgent *agent;
     SFLReceiver *receiver;
@@ -177,7 +179,7 @@ typedef struct _SFWB {
     time_t currentTime;
     int configCountDown;
     char *configFile;
-    time_t configFile_modTime;
+    apr_time_t configFile_modTime;
     SFWBConfig *config;
 
     /* master sFlow agent */
@@ -212,43 +214,22 @@ typedef struct _SFWBShared {
   -----------------___________________________------------------
 */
 
-static void sflow_init(SFWB *sm);
+static void sflow_init(SFWB *sm, server_rec *s);
 
 /*_________________---------------------------__________________
   _________________      mutex utils          __________________
   -----------------___________________________------------------
 */
 
-static bool lockOrDie(apr_thread_mutex_t *sem) {
-    ap_assert(sem == NULL || apr_thread_mutex_lock(sem) == 0);
-    return true;
+static bool_t lockOK(apr_thread_mutex_t *sem) {
+    return (sem == NULL || apr_thread_mutex_lock(sem) == 0);
 }
 
-static bool releaseOrDie(apr_thread_mutex_t *sem) {
-    ap_assert(sem == NULL || apr_thread_mutex_unlock(sem) == 0);
-    return true;
+static bool_t releaseOK(apr_thread_mutex_t *sem) {
+    return (sem == NULL || apr_thread_mutex_unlock(sem) == 0);
 }
 
-/*_________________---------------------------__________________
-  _________________   alloc in shared mem     __________________
-  -----------------___________________________------------------
-*/
-
-#if 0 /* not using this now */
-static void *sfwb_shared_mem_calloc(SFWB *sm, size_t bytes) {
-
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "sfwb_shared_mem_calloc - used=%u total=%u",
-                 sm->shared_bytes_used,
-                 sm->shared_bytes_total);
-
-    size_t roundedup = (((bytes << 4) + 1) >> 4); /* round to 128-bit boundary */
-    ap_assert((sm->shared_bytes_used + roundedup) < sm->shared_bytes_total);
-    void *ptr = sm->shared_mem_base + sm->shared_bytes_used;
-    memset(ptr, 0, roundedup);
-    sm->shared_bytes_used += roundedup;
-    return ptr;
-}
-#endif
+#define SEMLOCK_DO(_sem, _ctrl, _ok) for((_ctrl)=(_ok)=lockOK(_sem); (_ctrl); (_ctrl)=0,(_ok)=releaseOK(_sem))
 
 /*_________________---------------------------__________________
   _________________  master agent callbacks   __________________
@@ -323,7 +304,7 @@ static void sfwb_cb_sendPkt(void *magic, SFLAgent *agent, SFLReceiver *receiver,
   -----------------___________________________------------------
 */
 
-static bool ipv4MappedAddress(SFLIPv6 *ipv6addr, SFLIPv4 *ip4addr) {
+static bool_t ipv4MappedAddress(SFLIPv6 *ipv6addr, SFLIPv4 *ip4addr) {
     static char mapped_prefix[] = { 0,0,0,0,0,0,0,0,0,0,0xFF,0xFF };
     static char compat_prefix[] = { 0,0,0,0,0,0,0,0,0,0,0,0 };
     if(!memcmp(ipv6addr->addr, mapped_prefix, 12) ||
@@ -432,14 +413,14 @@ Look up an IP address and write into the SFLAddress slot provided.
 Discard everything else.
 */
 
-static bool sfwb_lookupAddress(char *name, SFLAddress *addr, apr_pool_t *configPool)
+static bool_t sfwb_lookupAddress(char *name, SFLAddress *addr, apr_pool_t *configPool)
 {
     int rc;
     apr_sockaddr_t *sa = NULL;
     apr_pool_t *pool = NULL;
     int ans = false;
 
-    ap_assert(name != NULL);
+    if(name == NULL) return false;
 
     if((rc = apr_pool_create(&pool, configPool)) != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "create_sflow_config: error creating lookupaddress sub-pool");
@@ -477,7 +458,7 @@ static bool sfwb_lookupAddress(char *name, SFLAddress *addr, apr_pool_t *configP
   read or re-read the sFlow config
 */
 
-static bool sfwb_syntaxOK(SFWBConfig *cfg, uint32_t line, uint32_t tokc, uint32_t tokcMin, uint32_t tokcMax, char *syntax) {
+static bool_t sfwb_syntaxOK(SFWBConfig *cfg, uint32_t line, uint32_t tokc, uint32_t tokcMin, uint32_t tokcMax, char *syntax) {
     if(tokc < tokcMin || tokc > tokcMax) {
         cfg->error = true;
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "syntax error on line %u: expected %s", line, syntax);
@@ -491,7 +472,7 @@ static void sfwb_syntaxError(SFWBConfig *cfg, uint32_t line, char *msg) {
     ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "syntax error on line %u: %s", line, msg);
 }    
 
-static SFWBConfig *sfwb_readConfig(SFWB *sm)
+static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
 {
     uint32_t rev_start = 0;
     uint32_t rev_end = 0;
@@ -500,7 +481,7 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
 
     /* create a sub-pool to allocate this new config from */
     if((rc = apr_pool_create(&pool, sm->configPool)) != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "create_sflow_config: error creating new config sub-pool");
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "create_sflow_config: error creating new config sub-pool");
         return NULL;
     }
     
@@ -511,7 +492,7 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
 
     FILE *cfg = NULL;
     if((cfg = fopen(sm->configFile, "r")) == NULL) {
-        ap_log_error(APLOG_MARK, APLOG_INFO, 0, NULL, "cannot open config file %s : %s", sm->configFile, strerror(errno));
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, "cannot open config file %s : %s", sm->configFile, strerror(errno));
         return NULL;
     }
     char line[SFWB_MAX_LINELEN+1];
@@ -597,7 +578,7 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
                                                    port,
                                                    APR_IPV4_ADDR_OK,
                                                    pool)) != APR_SUCCESS) {
-                        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "create_sflow_config: error allocating collector socket address");
+                        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "create_sflow_config: error allocating collector socket address");
                     }
                 }
                 else {
@@ -633,14 +614,14 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm)
   -----------------___________________________------------------
 */
 
-static void sfwb_apply_config(SFWB *sm, SFWBConfig *config)
+static void sfwb_apply_config(SFWB *sm, SFWBConfig *config, server_rec *s)
 {
     SFWBConfig *oldConfig = sm->config;
 
     if(config) {
         /* apply the new one */
         sm->config = config;
-        sflow_init(sm);
+        sflow_init(sm, s);
     }
 
     if(oldConfig) {
@@ -654,17 +635,17 @@ static void sfwb_apply_config(SFWB *sm, SFWBConfig *config)
   -----------------___________________________------------------
 */
         
-apr_time_t configModified(SFWB *sm) {
+apr_time_t configModified(SFWB *sm, server_rec *s) {
     int rc;
     apr_finfo_t configFileInfo;
     apr_pool_t *p;
     apr_time_t mtime = 0;
     /* a pool for temporary allocation */
     if((rc = apr_pool_create(&p, sm->configPool)) != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, " apr_pool_create() failed");
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, " apr_pool_create() failed");
     }
     if((rc = apr_stat(&configFileInfo, sm->configFile, APR_FINFO_MTIME, p)) != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "apr_stat() failed");
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_stat(%s) failed", sm->configFile);
     }
     else {
         mtime = configFileInfo.mtime;
@@ -678,29 +659,29 @@ apr_time_t configModified(SFWB *sm) {
   -----------------___________________________------------------
 */
         
-void sflow_tick(SFWB *sm) {
+void sflow_tick(SFWB *sm, server_rec *s) {
     if(--sm->configCountDown <= 0) {
-        apr_time_t modTime = configModified(sm);
+        apr_time_t modTime = configModified(sm, s);
         sm->configCountDown = SFWB_CONFIG_CHECK_S;
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "checking for config file change <%s>", sm->configFile);
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "checking for config file change <%s>", sm->configFile);
 
         if(modTime == 0) {
             /* config file missing */
-            sfwb_apply_config(sm, NULL);
+            sfwb_apply_config(sm, NULL, s);
         }
         else if(modTime != sm->configFile_modTime) {
             /* config file modified */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "config file changed <%s>", sm->configFile);
-            SFWBConfig *newConfig = sfwb_readConfig(sm);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "config file changed <%s> t=%lld", sm->configFile, modTime);
+            SFWBConfig *newConfig = sfwb_readConfig(sm, s);
             if(newConfig) {
                 /* config OK - apply it */
-                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "config file OK <%s>", sm->configFile);
-                sfwb_apply_config(sm, newConfig);
+                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "config file OK <%s>", sm->configFile);
+                sfwb_apply_config(sm, newConfig, s);
                 sm->configFile_modTime = modTime;
             }
             else {
                 /* bad config - ignore it (may be in transition) */
-                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "config file parse failed <%s>", sm->configFile);
+                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "config file parse failed <%s>", sm->configFile);
             }
         }
     }
@@ -715,13 +696,9 @@ void sflow_tick(SFWB *sm) {
   -----------------___________________________------------------
 */
 
-static void sflow_init(SFWB *sm)
+static void sflow_init(SFWB *sm, server_rec *s)
 {
     int rc;
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: sFlow=%p pid=%u config=%p",
-                 (void *)sm,
-                 getpid(),
-                 (void *)&sm->config);
 
     if(sm->configFile == NULL) {
         sm->configFile = SFWB_DEFAULT_CONFIGFILE;
@@ -729,7 +706,7 @@ static void sflow_init(SFWB *sm)
 
     if(sm->config == NULL) return;
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL, "in sflow_init: building sFlow agent");
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_init: building sFlow agent");
 
     {
         /* create or re-create the agent */
@@ -745,11 +722,11 @@ static void sflow_init(SFWB *sm)
         /* open the send sockets - one for v4 and another for v6 */
         if(!sm->socket4) {
             if((rc = apr_socket_create(&sm->socket4, APR_INET, SOCK_DGRAM, APR_PROTO_UDP, sm->masterPool)) != APR_SUCCESS)
-                ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "IPv4 send socket open failed");
+                ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "IPv4 send socket open failed");
         }
         if(!sm->socket6) {
             if((rc = apr_socket_create(&sm->socket6, APR_INET6, SOCK_DGRAM, APR_PROTO_UDP, sm->masterPool)) != APR_SUCCESS)
-                ap_log_error(APLOG_MARK, APLOG_ERR, rc, NULL, "IPv6 send socket open failed");
+                ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "IPv6 send socket open failed");
         }
         
         /* initialize the agent with it's address, bootime, callbacks etc. */
@@ -814,13 +791,13 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         return rc;
     }
 
-    /* now loop forever */
+    /* now loop forever - unless we encounter some kind of error */
     for(;;) {
 
         /* send ticks */
         apr_time_t now = apr_time_sec(apr_time_now());
         if(sm->currentTime != now) {
-            sflow_tick(sm);
+            sflow_tick(sm, s);
             sm->currentTime = now;
         }
 
@@ -837,17 +814,22 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         }
 
         if(rc == APR_SUCCESS && hdrBytesRead != 0) {
-            ap_assert(hdrBytesRead == hdrBytes);
+
+            if(hdrBytesRead != hdrBytes) break;
+
             /* now read the rest */
             size_t msgBytes = msg[0];
             uint32_t msgType = msg[1];
             uint32_t msgId = msg[2];
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - msgType/id = %u/%u msgBytes=%u\n",
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - msgType/id = %u/%u msgBytes=%u\n",
                          msgType,
                          msgId,
                          msgBytes);
-            ap_assert(msgType == SFLCOUNTERS_SAMPLE || msgType == SFLFLOW_SAMPLE);
-            ap_assert(msgBytes <= PIPE_BUF);
+
+            if(msgType != SFLCOUNTERS_SAMPLE && msgType != SFLFLOW_SAMPLE) break;
+
+            if(msgBytes > PIPE_BUF) break;
+
             size_t bodyBytes = msgBytes - hdrBytes;
             size_t bodyBytesRead = 0;
             if((rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead)) != APR_SUCCESS) {
@@ -855,9 +837,9 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
                 return rc;
             }
 
-            ap_assert(rc == APR_SUCCESS);
-            ap_assert(bodyBytesRead == bodyBytes);
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "in sflow_master - bodyBytes read=%u\n", bodyBytesRead);
+            if(bodyBytesRead != bodyBytes) break;
+
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - bodyBytes read=%u\n", bodyBytesRead);
 
             /* we may not have initialized the agent yet,  so the first few samples may end up being ignored */
             if(sm->sampler) {
@@ -895,7 +877,10 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             }
         }
     }
-    return APR_SUCCESS;
+
+    /* We only get here if there was an unexpected message error that caused us to break out of the loop above */
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error\n");
+    return APR_CHILD_DONE;
 }
 
 
@@ -943,6 +928,9 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
         apr_file_close(sm->pipe_write);
         /* and run the master */
         run_sflow_master(p, s, sm);
+        /* if anything goes wrong, we'll get here.  Just exit
+           the process.  This is likely to result in pipe write
+           errors in any child that is still running */
         exit(1);
         break;
     case APR_INPARENT:
@@ -1181,6 +1169,46 @@ static SFLHTTP_method methodNumberLookup(int method)
     }
 }
 
+
+/*_________________-----------------------------__________________
+  _________________      send_msg_to_master     __________________
+  -----------------_____________________________------------------
+*/
+
+static void send_msg_to_master(request_rec *r, SFWB *sm, void *msg, uint32_t msgBytes, char *msgDescr)
+{
+    apr_status_t rc;
+    if(msgBytes > PIPE_BUF) {
+        /* if msgBytes greater than PIPE_BUF the pipe write will not be atomic. Should never happen,
+           but can't risk it, since we are relying on this as the synchronization mechanism between processes */
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write on pipe (%s)",
+                      msgBytes,
+                      PIPE_BUF,
+                      msgDescr);
+        /* this counts as an sFlow drop-event */
+        sm->child->sampler->dropEvents++;
+    }
+    else if((rc = apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytes)) != APR_SUCCESS) {
+        
+        /* this counts as an sFlow drop-event too */
+        sm->child->sampler->dropEvents++;
+        
+        if(APR_STATUS_IS_EAGAIN(rc)) {
+            /* this can happen if the pipe is full - e.g. under high load conditions with
+               agressive sampling.  The pipe is non-blocking so we'll get EAGAIN or EWOULDBLOCK.
+               APR combines those two into APR_STATUS_IS_EAGAIN. */
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "got EAGAIN on pipe write - increment drop count (%s)",
+                          msgDescr);
+        }
+        else {
+            /* Some other error. Perhaps the pipe was closed at the other end.
+               This is a show-stopper. Just park. */
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rc, r, "error writing to pipe (%s)", msgDescr);
+            sm->child->sflow_disabled = true;
+        }
+    }
+}
+
 /*_________________-----------------------------__________________
   _________________ sflow_multi_log_transaction __________________
   -----------------_____________________________------------------
@@ -1192,143 +1220,126 @@ static int sflow_multi_log_transaction(request_rec *r)
 {
     SFWB *sm = GET_CONFIG_DATA(r->server);
     SFWBChild *child = sm->child;
+    if(child->sflow_disabled) {
+        /* Something bad happened, such as the pipe closing under our feet.
+           Do nothing more. Just wait for the men in white coats. */
+        return OK;
+    }
+
     apr_time_t now_uS = apr_time_now();
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)\n", child->sampler->skip);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)", child->sampler->skip);
     uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
 
     /* The simplest thing here is just to mutex-lock this whole step.
        Most times through here we do very little anyway.  The alternative
        would be to use atomic operations for the increments/decrements/tests that
-       we do every time, and only grab the mutex when we decide to take a sample,
+       we do every time, and only grab the mutex when we really have to,
        but it's not clear if that would help or not.  It could easily end up
        costing more. */
-    lockOrDie(child->mutex);
-
-    SFLHTTP_counters *ctrs = &child->http_counters.counterBlock.http;
-    switch(method) {
-    case SFHTTP_HEAD: ctrs->method_head_count++; break;
-    case SFHTTP_GET: ctrs->method_get_count++; break;
-    case SFHTTP_PUT: ctrs->method_put_count++; break;
-    case SFHTTP_POST: ctrs->method_post_count++; break;
-    case SFHTTP_DELETE: ctrs->method_delete_count++; break;
-    case SFHTTP_CONNECT: ctrs->method_connect_count++; break;
-    case SFHTTP_OPTIONS: ctrs->method_option_count++; break;
-    case SFHTTP_TRACE: ctrs->method_trace_count++; break;
-    default: ctrs->method_other_count++; break;
-    }
-    if(r->status < 100) ctrs->status_other_count++;
-    else if(r->status < 200) ctrs->status_1XX_count++;
-    else if(r->status < 300) ctrs->status_2XX_count++;
-    else if(r->status < 400) ctrs->status_3XX_count++;
-    else if(r->status < 500) ctrs->status_4XX_count++;
-    else if(r->status < 600) ctrs->status_5XX_count++;    
-    else ctrs->status_other_count++;
+    bool_t ctrl = false;
+    bool_t lockingOK = false;
+    SEMLOCK_DO(child->mutex, ctrl, lockingOK) {
+        SFLHTTP_counters *ctrs = &child->http_counters.counterBlock.http;
+        switch(method) {
+        case SFHTTP_HEAD: ctrs->method_head_count++; break;
+        case SFHTTP_GET: ctrs->method_get_count++; break;
+        case SFHTTP_PUT: ctrs->method_put_count++; break;
+        case SFHTTP_POST: ctrs->method_post_count++; break;
+        case SFHTTP_DELETE: ctrs->method_delete_count++; break;
+        case SFHTTP_CONNECT: ctrs->method_connect_count++; break;
+        case SFHTTP_OPTIONS: ctrs->method_option_count++; break;
+        case SFHTTP_TRACE: ctrs->method_trace_count++; break;
+        default: ctrs->method_other_count++; break;
+        }
+        if(r->status < 100) ctrs->status_other_count++;
+        else if(r->status < 200) ctrs->status_1XX_count++;
+        else if(r->status < 300) ctrs->status_2XX_count++;
+        else if(r->status < 400) ctrs->status_3XX_count++;
+        else if(r->status < 500) ctrs->status_4XX_count++;
+        else if(r->status < 600) ctrs->status_5XX_count++;    
+        else ctrs->status_other_count++;
    
-    if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler) == 0)) {
-        /* don't have a sampling-rate setting yet. Check to see... */
-        sflow_set_random_skip(child);
-    }
-    else if(unlikely(sfl_sampler_takeSample(child->sampler))) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow take sample: r->method_number=%u\n", r->method_number);
-        /* point to the start of the datagram */
-        uint32_t *msg = child->receiver->sampleCollector.datap;
-        /* msglen, msgType, sample pool and drops */
-        sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
-        sfl_receiver_put32(child->receiver, SFLFLOW_SAMPLE);
-        sfl_receiver_put32(child->receiver, SFLFLOW_HTTP);
-        sfl_receiver_put32(child->receiver, child->sampler->samplePool);
-        sfl_receiver_put32(child->receiver, child->sampler->dropEvents);
-        /* and reset so they can be accumulated by the other process */
-        child->sampler->samplePool = 0;
-        child->sampler->dropEvents = 0;
-        /* accumulate the pktlen here too, to satisfy a sanity-check in the sflow library (receiver) */
-        child->receiver->sampleCollector.pktlen += 20;
-
-        const char *referer = apr_table_get(r->headers_in, "Referer");
-        const char *useragent = apr_table_get(r->headers_in, "User-Agent");
-        const char *contentType = apr_table_get(r->headers_in, "Content-Type");
-
-        /* encode the transaction sample next */
-        sflow_sample_http(child->sampler,
-                          r->connection,
-                          method,
-                          r->proto_num,
-                          r->uri, my_strlen(r->uri), /* r->the_request ? */
-                          r->hostname, my_strlen(r->hostname), /* r->server->server_hostname ?*/
-                          referer, my_strlen(referer),
-                          useragent, my_strlen(useragent),
-                          r->user, my_strlen(r->user),
-                          contentType, my_strlen(contentType),
-                          r->bytes_sent,
-                          now_uS - r->request_time,
-                          r->status);
-
-        /* get the message bytes including the sample */
-        uint32_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
-        /* write this in as the first 32-bit word */
-        *msg = msgBytes;
-        /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen, */
-        /* but can't risk it, since we are relying on this as the synchronization mechanism. */
-        if(msgBytes > PIPE_BUF) {
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
-            /* this counts as an sFlow drop-event */
-            child->sampler->dropEvents++;
+        if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler) == 0)) {
+            /* don't have a sampling-rate setting yet. Check to see... */
+            sflow_set_random_skip(child);
         }
-        else {
-            apr_size_t msgBytes2 = (apr_size_t)msgBytes;
-            if(apr_file_write_full(sm->pipe_write, msg, msgBytes2, &msgBytes2) != APR_SUCCESS) {
-                /* this can happen if the pipe is full - e.g. under high load conditions with
-                   agressive sampling.  The pipe is non-blocking so we'll get EAGAIN or EWOULDBLOCK */
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "error in apr_file_write_full()\n");
-                /* this counts as an sFlow drop-event */
-                child->sampler->dropEvents++;
-            }
+        else if(unlikely(sfl_sampler_takeSample(child->sampler))) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow take sample: r->method_number=%u", r->method_number);
+            /* point to the start of the datagram */
+            uint32_t *msg = child->receiver->sampleCollector.datap;
+            /* msglen, msgType, sample pool and drops */
+            sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
+            sfl_receiver_put32(child->receiver, SFLFLOW_SAMPLE);
+            sfl_receiver_put32(child->receiver, SFLFLOW_HTTP);
+            sfl_receiver_put32(child->receiver, child->sampler->samplePool);
+            sfl_receiver_put32(child->receiver, child->sampler->dropEvents);
+            /* and reset so they can be accumulated by the other process */
+            child->sampler->samplePool = 0;
+            child->sampler->dropEvents = 0;
+            /* accumulate the pktlen here too, to satisfy a sanity-check in the sflow library (receiver) */
+            child->receiver->sampleCollector.pktlen += 20;
+
+            const char *referer = apr_table_get(r->headers_in, "Referer");
+            const char *useragent = apr_table_get(r->headers_in, "User-Agent");
+            const char *contentType = apr_table_get(r->headers_in, "Content-Type");
+
+            /* encode the transaction sample next */
+            sflow_sample_http(child->sampler,
+                              r->connection,
+                              method,
+                              r->proto_num,
+                              r->uri, my_strlen(r->uri), /* r->the_request ? */
+                              r->hostname, my_strlen(r->hostname), /* r->server->server_hostname ?*/
+                              referer, my_strlen(referer),
+                              useragent, my_strlen(useragent),
+                              r->user, my_strlen(r->user),
+                              contentType, my_strlen(contentType),
+                              r->bytes_sent,
+                              now_uS - r->request_time,
+                              r->status);
+
+            /* get the message bytes including the sample */
+            apr_size_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
+            /* write this in as the first 32-bit word */
+            *msg = msgBytes;
+            /* send this http sample up to the master */
+            send_msg_to_master(r, sm, msg, msgBytes, "http sample");
+            /* reset the encoder for next time */
+            sfl_receiver_resetSampleCollector(child->receiver);
         }
-        sfl_receiver_resetSampleCollector(child->receiver);
-    }
 
     
-    if((now_uS - child->lastTickTime) > SFWB_CHILD_TICK_US) {
-        child->lastTickTime = now_uS;
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "child tick - sending counters\n");
-        /* point to the start of the datagram */
-        uint32_t *msg = child->receiver->sampleCollector.datap;
-        /* msglen, msgType, msgId */
-        sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
-        sfl_receiver_put32(child->receiver, SFLCOUNTERS_SAMPLE);
-        sfl_receiver_put32(child->receiver, SFLCOUNTERS_HTTP);
-        sfl_receiver_putOpaque(child->receiver, (char *)ctrs, sizeof(*ctrs));
-        /* now reset my private counter block so that we only send the delta each time */
-        memset(ctrs, 0, sizeof(*ctrs));
-        /* get the msg bytes */
-        uint32_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
-        /* write this in as the first 32-bit word */
-        *msg = msgBytes;
-
-        /* if greater than PIPE_BUF the pipe write will not be atomic. Should never happen,
-           but can't risk it, since we are relying on this as the synchronization mechanism */
-        if(msgBytes > PIPE_BUF) {
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write", msgBytes, PIPE_BUF);
-            /* this counts as an sFlow drop-event */
-            child->sampler->dropEvents++;
+        if((now_uS - child->lastTickTime) > SFWB_CHILD_TICK_US) {
+            child->lastTickTime = now_uS;
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "child tick - sending counters\n");
+            /* point to the start of the datagram */
+            uint32_t *msg = child->receiver->sampleCollector.datap;
+            /* msglen, msgType, msgId */
+            sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
+            sfl_receiver_put32(child->receiver, SFLCOUNTERS_SAMPLE);
+            sfl_receiver_put32(child->receiver, SFLCOUNTERS_HTTP);
+            sfl_receiver_putOpaque(child->receiver, (char *)ctrs, sizeof(*ctrs));
+            /* now reset my private counter block so that we only send the delta each time */
+            memset(ctrs, 0, sizeof(*ctrs));
+            /* get the msg bytes */
+            apr_size_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
+            /* write this in as the first 32-bit word */
+            *msg = msgBytes;
+            /* send this counter update up to the master */
+            send_msg_to_master(r, sm, msg, msgBytes, "counter update");
+            /* reset the encoder for next time */
+            sfl_receiver_resetSampleCollector(child->receiver);
+            /* check in case the sampling-rate setting has changed. */
+            sflow_set_random_skip(child);
         }
-        else {
-            apr_size_t msgBytes2 = (apr_size_t)msgBytes;
-            if(apr_file_write_full(sm->pipe_write, msg, msgBytes2, &msgBytes2) != APR_SUCCESS) {
-                /* this can happen if the pipe is full - e.g. under high load conditions with
-                   agressive sampling.  The pipe is non-blocking so we'll get EAGAIN or EWOULDBLOCK */
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "error in apr_file_write_full()\n");
-                /* this counts as an sFlow drop-event */
-                child->sampler->dropEvents++;
-            }
-        }
-        sfl_receiver_resetSampleCollector(child->receiver);
+    } /* SEMLOCK_DO */
 
-        /* check in case the sampling-rate setting has changed. */
-        sflow_set_random_skip(child);
+    if(!lockingOK) {
+        /* something went wrong with acquiring or releasing the mutex lock.
+           That's a show-stopper. Bow out gracefully. */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "sFlow mutex locking error - parking module");
+        child->sflow_disabled = true;
     }
-
-    releaseOrDie(child->mutex);
 
     return OK;
 }
