@@ -587,8 +587,11 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
             }
             else if(strcasecmp(tokv[0], "header") == 0) { /* ignore */ }
             else if(strcasecmp(tokv[0], "agent") == 0) { /* ignore */ }
+            else if(strncasecmp(tokv[0], "sampling.", 9) == 0) { /* ignore other sampling.<app> settings */ }
+            else if(strncasecmp(tokv[0], "polling.", 8) == 0) { /* ignore other polling.<app> settings */ }
             else {
-                sfwb_syntaxError(config, lineNo, "unknown var=value setting");
+                /* don't abort just because a new setting was added */
+                /* sfwb_syntaxError(config, lineNo, "unknown var=value setting"); */
             }
         }
     }
