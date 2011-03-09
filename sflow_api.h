@@ -17,29 +17,8 @@
 #ifndef SFLOW_API_H
 #define SFLOW_API_H 1
 
-/* define SFLOW_DO_SOCKET to 1 if you want the agent
-   to send the packets itself, otherwise set the sendFn
-   callback in sfl_agent_init.*/
-/* #define SFLOW_DO_SOCKET */
-
-#include <stdio.h>
-#include <stdlib.h>
-#ifndef _WIN32
-#include <unistd.h>
-#include <arpa/inet.h>
-#endif /*_WIN32 */
-#include <errno.h>
-#include <string.h>
-#include <sys/types.h>
-
-
-#ifdef SFLOW_DO_SOCKET
-#include <sys/socket.h>
-#include <netinet/in_systm.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#endif
-
+#include <apr.h>
+#include <apr_time.h>
 #include "sflow.h"
 
 /*
@@ -65,9 +44,9 @@
 */
 
 typedef struct _SFLDataSource_instance {
-  uint32_t ds_class;
-  uint32_t ds_index;
-  uint32_t ds_instance;
+  apr_uint32_t ds_class;
+  apr_uint32_t ds_index;
+  apr_uint32_t ds_instance;
 } SFLDataSource_instance;
 
 #ifdef SFL_USE_32BIT_INDEX
@@ -91,14 +70,14 @@ typedef struct _SFLDataSource_instance {
     (dsi).ds_instance = (inst);			\
   } while(0)
 
-#define SFL_SAMPLECOLLECTOR_DATA_QUADS (SFL_MAX_DATAGRAM_SIZE + SFL_DATA_PAD) / sizeof(uint32_t)
+#define SFL_SAMPLECOLLECTOR_DATA_QUADS (SFL_MAX_DATAGRAM_SIZE + SFL_DATA_PAD) / sizeof(apr_uint32_t)
 
 typedef struct _SFLSampleCollector {
-  uint32_t data[SFL_SAMPLECOLLECTOR_DATA_QUADS];
-  uint32_t *datap; /* packet fill pointer */
-  uint32_t pktlen; /* accumulated size */
-  uint32_t packetSeqNo;
-  uint32_t numSamples;
+  apr_uint32_t data[SFL_SAMPLECOLLECTOR_DATA_QUADS];
+  apr_uint32_t *datap; /* packet fill pointer */
+  apr_uint32_t pktlen; /* accumulated size */
+  apr_uint32_t packetSeqNo;
+  apr_uint32_t numSamples;
 } SFLSampleCollector;
 
 struct _SFLAgent;  /* forward decl */
@@ -107,19 +86,15 @@ typedef struct _SFLReceiver {
   struct _SFLReceiver *nxt;
   /* MIB fields */
   char *sFlowRcvrOwner;
-  time_t sFlowRcvrTimeout;
-  uint32_t sFlowRcvrMaximumDatagramSize;
+  apr_time_t sFlowRcvrTimeout;
+  apr_uint32_t sFlowRcvrMaximumDatagramSize;
   SFLAddress sFlowRcvrAddress;
-  uint32_t sFlowRcvrPort;
-  uint32_t sFlowRcvrDatagramVersion;
+  apr_uint32_t sFlowRcvrPort;
+  apr_uint32_t sFlowRcvrDatagramVersion;
   /* public fields */
   struct _SFLAgent *agent;    /* pointer to my agent */
   /* private fields */
   SFLSampleCollector sampleCollector;
-#ifdef SFLOW_DO_SOCKET
-  struct sockaddr_in receiver4;
-  struct sockaddr_in6 receiver6;
-#endif
 } SFLReceiver;
 
 typedef struct _SFLSampler {
@@ -129,22 +104,22 @@ typedef struct _SFLSampler {
   struct _SFLSampler *hash_nxt;
   /* MIB fields */
   SFLDataSource_instance dsi;
-  uint32_t sFlowFsReceiver;
-  uint32_t sFlowFsPacketSamplingRate;
-  uint32_t sFlowFsMaximumHeaderSize;
+  apr_uint32_t sFlowFsReceiver;
+  apr_uint32_t sFlowFsPacketSamplingRate;
+  apr_uint32_t sFlowFsMaximumHeaderSize;
   /* public fields */
   struct _SFLAgent *agent; /* pointer to my agent */
   void *userData;          /* can be useful to hang something else here */
   /* private fields */
   SFLReceiver *myReceiver;
-  uint32_t skip;
-  uint32_t samplePool;
-  uint32_t dropEvents;
-  uint32_t flowSampleSeqNo;
+  apr_uint32_t skip;
+  apr_uint32_t samplePool;
+  apr_uint32_t dropEvents;
+  apr_uint32_t flowSampleSeqNo;
   /* rate checking */
-  uint32_t samplesThisTick;
-  uint32_t samplesLastTick;
-  uint32_t backoffThreshold;
+  apr_uint32_t samplesThisTick;
+  apr_uint32_t samplesLastTick;
+  apr_uint32_t backoffThreshold;
 } SFLSampler;
 
 /* declare */
@@ -159,8 +134,8 @@ typedef struct _SFLPoller {
   struct _SFLPoller *nxt;
   /* MIB fields */
   SFLDataSource_instance dsi;
-  uint32_t sFlowCpReceiver;
-  time_t sFlowCpInterval;
+  apr_uint32_t sFlowCpReceiver;
+  apr_time_t sFlowCpInterval;
   /* public fields */
   struct _SFLAgent *agent; /* pointer to my agent */
   void *magic;             /* ptr to pass back in getCountersFn() */
@@ -168,8 +143,8 @@ typedef struct _SFLPoller {
   getCountersFn_t getCountersFn;
   /* private fields */
   SFLReceiver *myReceiver;
-  time_t countersCountdown;
-  uint32_t countersSampleSeqNo;
+  apr_time_t countersCountdown;
+  apr_uint32_t countersSampleSeqNo;
 } SFLPoller;
 
 typedef void *(*allocFn_t)(void *magic,               /* callback to allocate space on heap */
@@ -187,8 +162,8 @@ typedef void (*errorFn_t)(void *magic,                /* callback to log error m
 typedef void (*sendFn_t)(void *magic,                 /* optional override fn to send packet */
 			 struct _SFLAgent *agent,
 			 SFLReceiver *receiver,
-			 u_char *pkt,
-			 uint32_t pktLen);
+			 apr_byte_t *pkt,
+			 apr_uint32_t pktLen);
 
 
 /* prime numbers are good for hash tables */
@@ -199,27 +174,23 @@ typedef struct _SFLAgent {
   SFLSampler *samplers;   /* the list of samplers */
   SFLPoller  *pollers;    /* the list of samplers */
   SFLReceiver *receivers; /* the array of receivers */
-  time_t bootTime;        /* time when we booted or started */
-  time_t now;             /* time now */
+  apr_time_t bootTime;        /* time when we booted or started */
+  apr_time_t now;             /* time now */
   SFLAddress myIP;        /* IP address of this node */
-  uint32_t subId;        /* sub_agent_id */
+  apr_uint32_t subId;        /* sub_agent_id */
   void *magic;            /* ptr to pass back in logging and alloc fns */
   allocFn_t allocFn;
   freeFn_t freeFn;
   errorFn_t errorFn;
   sendFn_t sendFn;
-#ifdef SFLOW_DO_SOCKET
-  int receiverSocket4;
-  int receiverSocket6;
-#endif
 } SFLAgent;
 
 /* call this at the start with a newly created agent */
 void sfl_agent_init(SFLAgent *agent,
 		    SFLAddress *myIP, /* IP address of this agent */
-		    uint32_t subId,  /* agent_sub_id */
-		    time_t bootTime,  /* agent boot time */
-		    time_t now,       /* time now */
+		    apr_uint32_t subId,  /* agent_sub_id */
+		    apr_time_t bootTime,  /* agent boot time */
+		    apr_time_t now,       /* time now */
 		    void *magic,      /* ptr to pass back in logging and alloc fns */
 		    allocFn_t allocFn,
 		    freeFn_t freeFn,
@@ -252,41 +223,41 @@ SFLSampler  *sfl_agent_getSampler(SFLAgent *agent, SFLDataSource_instance *pdsi)
 SFLSampler  *sfl_agent_getNextSampler(SFLAgent *agent, SFLDataSource_instance *pdsi);
 SFLPoller   *sfl_agent_getPoller(SFLAgent *agent, SFLDataSource_instance *pdsi);
 SFLPoller   *sfl_agent_getNextPoller(SFLAgent *agent, SFLDataSource_instance *pdsi);
-SFLReceiver *sfl_agent_getReceiver(SFLAgent *agent, uint32_t receiverIndex);
-SFLReceiver *sfl_agent_getNextReceiver(SFLAgent *agent, uint32_t receiverIndex);
+SFLReceiver *sfl_agent_getReceiver(SFLAgent *agent, apr_uint32_t receiverIndex);
+SFLReceiver *sfl_agent_getNextReceiver(SFLAgent *agent, apr_uint32_t receiverIndex);
 
 /* jump table access - for performance */
-SFLSampler *sfl_agent_getSamplerByIfIndex(SFLAgent *agent, uint32_t ifIndex);
+SFLSampler *sfl_agent_getSamplerByIfIndex(SFLAgent *agent, apr_uint32_t ifIndex);
 
 /* random number generator - used by sampler and poller */
-uint32_t sfl_random(uint32_t mean);
-void sfl_random_init(uint32_t seed);
+apr_uint32_t sfl_random(apr_uint32_t mean);
+void sfl_random_init(apr_uint32_t seed);
 
 /* call these functions to GET and SET MIB values */
 
 /* receiver */
 char *      sfl_receiver_get_sFlowRcvrOwner(SFLReceiver *receiver);
 void        sfl_receiver_set_sFlowRcvrOwner(SFLReceiver *receiver, char *sFlowRcvrOwner);
-time_t      sfl_receiver_get_sFlowRcvrTimeout(SFLReceiver *receiver);
-void        sfl_receiver_set_sFlowRcvrTimeout(SFLReceiver *receiver, time_t sFlowRcvrTimeout);
-uint32_t   sfl_receiver_get_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver);
-void        sfl_receiver_set_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver, uint32_t sFlowRcvrMaximumDatagramSize);
+apr_time_t      sfl_receiver_get_sFlowRcvrTimeout(SFLReceiver *receiver);
+void        sfl_receiver_set_sFlowRcvrTimeout(SFLReceiver *receiver, apr_time_t sFlowRcvrTimeout);
+apr_uint32_t   sfl_receiver_get_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver);
+void        sfl_receiver_set_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver, apr_uint32_t sFlowRcvrMaximumDatagramSize);
 SFLAddress *sfl_receiver_get_sFlowRcvrAddress(SFLReceiver *receiver);
 void        sfl_receiver_set_sFlowRcvrAddress(SFLReceiver *receiver, SFLAddress *sFlowRcvrAddress);
-uint32_t   sfl_receiver_get_sFlowRcvrPort(SFLReceiver *receiver);
-void        sfl_receiver_set_sFlowRcvrPort(SFLReceiver *receiver, uint32_t sFlowRcvrPort);
+apr_uint32_t   sfl_receiver_get_sFlowRcvrPort(SFLReceiver *receiver);
+void        sfl_receiver_set_sFlowRcvrPort(SFLReceiver *receiver, apr_uint32_t sFlowRcvrPort);
 /* sampler */
-uint32_t sfl_sampler_get_sFlowFsReceiver(SFLSampler *sampler);
-void      sfl_sampler_set_sFlowFsReceiver(SFLSampler *sampler, uint32_t sFlowFsReceiver);
-uint32_t sfl_sampler_get_sFlowFsPacketSamplingRate(SFLSampler *sampler);
-void      sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, uint32_t sFlowFsPacketSamplingRate);
-uint32_t sfl_sampler_get_sFlowFsMaximumHeaderSize(SFLSampler *sampler);
-void      sfl_sampler_set_sFlowFsMaximumHeaderSize(SFLSampler *sampler, uint32_t sFlowFsMaximumHeaderSize);
+apr_uint32_t sfl_sampler_get_sFlowFsReceiver(SFLSampler *sampler);
+void      sfl_sampler_set_sFlowFsReceiver(SFLSampler *sampler, apr_uint32_t sFlowFsReceiver);
+apr_uint32_t sfl_sampler_get_sFlowFsPacketSamplingRate(SFLSampler *sampler);
+void      sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, apr_uint32_t sFlowFsPacketSamplingRate);
+apr_uint32_t sfl_sampler_get_sFlowFsMaximumHeaderSize(SFLSampler *sampler);
+void      sfl_sampler_set_sFlowFsMaximumHeaderSize(SFLSampler *sampler, apr_uint32_t sFlowFsMaximumHeaderSize);
 /* poller */
-uint32_t sfl_poller_get_sFlowCpReceiver(SFLPoller *poller);
-void      sfl_poller_set_sFlowCpReceiver(SFLPoller *poller, uint32_t sFlowCpReceiver);
-uint32_t sfl_poller_get_sFlowCpInterval(SFLPoller *poller);
-void      sfl_poller_set_sFlowCpInterval(SFLPoller *poller, uint32_t sFlowCpInterval);
+apr_uint32_t sfl_poller_get_sFlowCpReceiver(SFLPoller *poller);
+void      sfl_poller_set_sFlowCpReceiver(SFLPoller *poller, apr_uint32_t sFlowCpReceiver);
+apr_uint32_t sfl_poller_get_sFlowCpInterval(SFLPoller *poller);
+void      sfl_poller_set_sFlowCpInterval(SFLPoller *poller, apr_uint32_t sFlowCpInterval);
 
 /* call this to indicate a discontinuity with a counter like samplePool so that the
    sflow collector will ignore the next delta */
@@ -303,17 +274,17 @@ int sfl_sampler_takeSample(SFLSampler *sampler);
 /* call this to set a maximum samples-per-second threshold. If the sampler reaches this
    threshold it will automatically back off the sampling rate. A value of 0 disables the
    mechanism */
-void sfl_sampler_set_backoffThreshold(SFLSampler *sampler, uint32_t samplesPerSecond);
-uint32_t sfl_sampler_get_backoffThreshold(SFLSampler *sampler);
-uint32_t sfl_sampler_get_samplesLastTick(SFLSampler *sampler);
+void sfl_sampler_set_backoffThreshold(SFLSampler *sampler, apr_uint32_t samplesPerSecond);
+apr_uint32_t sfl_sampler_get_backoffThreshold(SFLSampler *sampler);
+apr_uint32_t sfl_sampler_get_samplesLastTick(SFLSampler *sampler);
 
 
 /* call this once per second (N.B. not on interrupt stack i.e. not hard real-time) */
-void sfl_agent_tick(SFLAgent *agent, time_t now);
+void sfl_agent_tick(SFLAgent *agent, apr_time_t now);
 
 /* call this with each flow sample */
 void sfl_sampler_writeFlowSample(SFLSampler *sampler, SFL_FLOW_SAMPLE_TYPE *fs);
-void sfl_sampler_writeEncodedFlowSample(SFLSampler *sampler, char *xdrBytes, uint32_t len);
+void sfl_sampler_writeEncodedFlowSample(SFLSampler *sampler, char *xdrBytes, apr_uint32_t len);
 
 /* call this to push counters samples (usually done in the getCountersFn callback) */
 void sfl_poller_writeCountersSample(SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs);
@@ -329,23 +300,20 @@ void sfl_sampler_init(SFLSampler *sampler, SFLAgent *agent, SFLDataSource_instan
 void sfl_poller_init(SFLPoller *poller, SFLAgent *agent, SFLDataSource_instance *pdsi, void *magic, getCountersFn_t getCountersFn);
 
 
-void sfl_receiver_tick(SFLReceiver *receiver, time_t now);
-void sfl_poller_tick(SFLPoller *poller, time_t now);
-void sfl_sampler_tick(SFLSampler *sampler, time_t now);
+void sfl_receiver_tick(SFLReceiver *receiver, apr_time_t now);
+void sfl_poller_tick(SFLPoller *poller, apr_time_t now);
+void sfl_sampler_tick(SFLSampler *sampler, apr_time_t now);
 
 int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs);
-int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs, char *xdrBytes, uint32_t packedSize);
+int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs, char *xdrBytes, apr_uint32_t packedSize);
 int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_TYPE *cs);
 
 void sfl_agent_resetReceiver(SFLAgent *agent, SFLReceiver *receiver);
 
 void sfl_agent_error(SFLAgent *agent, char *modName, char *msg);
-void sfl_agent_sysError(SFLAgent *agent, char *modName, char *msg);
 
-uint32_t sfl_receiver_samplePacketsSent(SFLReceiver *receiver);
+apr_uint32_t sfl_receiver_samplePacketsSent(SFLReceiver *receiver);
 
-#define SFL_ALLOC malloc
-#define SFL_FREE free
 
 /* If supported, give compiler hints for branch prediction. */
 #if !defined(__GNUC__) || (__GNUC__ == 2 && __GNUC_MINOR__ < 96)
@@ -356,7 +324,7 @@ uint32_t sfl_receiver_samplePacketsSent(SFLReceiver *receiver);
 #define unlikely(x)     __builtin_expect((x),0)
 
 /* selective exposure of some internal hooks,  just for this project */
-void sfl_receiver_put32(SFLReceiver *receiver, uint32_t val);
+void sfl_receiver_put32(SFLReceiver *receiver, apr_uint32_t val);
 void sfl_receiver_putOpaque(SFLReceiver *receiver, char *val, int len);
 void sfl_receiver_resetSampleCollector(SFLReceiver *receiver);
 

@@ -56,12 +56,17 @@
 
 /* Apache Runtime Library */
 #include "apr.h"
+#include "apr_time.h"
 
 /* Apache HTTPD includes */
 #include "httpd.h"
 #include "http_config.h"
 #include "http_protocol.h"
 #include "http_log.h"
+
+#define APR_WANT_BYTEFUNC   /* htonl */
+#define ARP_WANT_MEMFUNC    /* memcpy */
+#include "apr_want.h"
 
 /* make sure we have a value for PIPE_BUF, the max
    size of an atomic write on a pipe. Currently Linux
@@ -81,6 +86,8 @@
 #include "sflow_api.h"
 
 #ifdef SFWB_DEBUG
+/* allow non-portable calls when debugging */
+#include <unistd.h> /* just for getpid() */
 #include "sys/syscall.h" /* just for gettid() */
 #define MYGETTID (pid_t)syscall(SYS_gettid)
 #include "ap_mpm.h"
@@ -89,8 +96,8 @@
 /* #include <stdbool.h> */
 #define true 1
 #define false 0
-/* use 32-bits for boot_t to help avoid unaligned fields */
-typedef uint32_t bool_t;
+/* use 32-bits for bool_t to help avoid unaligned fields */
+typedef apr_uint32_t bool_t;
 
 /*_________________---------------------------__________________
   _________________   module config data      __________________
@@ -137,17 +144,17 @@ module AP_MODULE_DECLARE_DATA sflow_module;
 
 typedef struct _SFWBCollector {
     apr_sockaddr_t *sa;
-    uint16_t priority;
+    apr_uint16_t priority;
 } SFWBCollector;
 
 typedef struct _SFWBConfig {
-    int error;
-    uint32_t sampling_n;
-    uint32_t polling_secs;
+    apr_int32_t error;
+    apr_uint32_t sampling_n;
+    apr_uint32_t polling_secs;
     bool_t got_sampling_n_http;
     bool_t got_polling_secs_http;
     SFLAddress agentIP;
-    uint32_t num_collectors;
+    apr_uint32_t num_collectors;
     SFWBCollector collectors[SFWB_MAX_COLLECTORS];
     apr_pool_t *pool;
 } SFWBConfig;
@@ -176,8 +183,8 @@ typedef struct _SFWB {
     apr_pool_t *configPool;
 
     /* master config */
-    time_t currentTime;
-    int configCountDown;
+    apr_time_t currentTime;
+    apr_int32_t configCountDown;
     char *configFile;
     apr_time_t configFile_modTime;
     SFWBConfig *config;
@@ -197,15 +204,15 @@ typedef struct _SFWB {
     /* shared mem for master->child IPC */
     apr_shm_t *shared_mem;
     void *shared_mem_base;
-    size_t shared_bytes_total;
-    size_t shared_bytes_used;
+    apr_size_t shared_bytes_total;
+    apr_size_t shared_bytes_used;
 
     /* per child state */
     SFWBChild *child;
 } SFWB;
 
 typedef struct _SFWBShared {
-    uint32_t sflow_skip;
+    apr_uint32_t sflow_skip;
     SFLCounters_sample_element http_counters;
 } SFWBShared;
 
@@ -273,11 +280,11 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
     sfl_poller_writeCountersSample(poller, cs);
 }
 
-static void sfwb_cb_sendPkt(void *magic, SFLAgent *agent, SFLReceiver *receiver, u_char *pkt, uint32_t pktLen)
+static void sfwb_cb_sendPkt(void *magic, SFLAgent *agent, SFLReceiver *receiver, u_char *pkt, apr_uint32_t pktLen)
 {
     SFWB *sm = (SFWB *)magic;
     apr_socket_t *soc = NULL;
-    int c = 0;
+    apr_int32_t c = 0;
     if(!sm->config) {
         /* config is disabled */
         return;
@@ -288,7 +295,7 @@ static void sfwb_cb_sendPkt(void *magic, SFLAgent *agent, SFLReceiver *receiver,
         if(coll->sa) {
             soc = (coll->sa->family == APR_INET6) ? sm->socket6 : sm->socket4;
             apr_size_t len = (apr_size_t)pktLen;
-            int rc = apr_socket_sendto(soc, coll->sa, 0, (char *)pkt, &len);
+            apr_status_t rc = apr_socket_sendto(soc, coll->sa, 0, (char *)pkt, &len);
             if(rc != APR_SUCCESS && errno != EINTR) {
                 ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "socket sendto error");
             }
@@ -320,7 +327,15 @@ static bool_t ipv4MappedAddress(SFLIPv6 *ipv6addr, SFLIPv4 *ip4addr) {
   -----------------___________________________------------------
 */
 
-static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, SFLHTTP_method method, int proto_num, const char *uri, size_t urilen, const char *host, size_t hostlen, const char *referrer, size_t referrerlen, const char *useragent, size_t useragentlen, const char *authuser, size_t authuserlen, const char *mimetype, size_t mimetypelen, uint64_t bytes, uint32_t duration_uS, uint32_t status)
+
+static int my_strnlen(const char *s, apr_size_t max) {
+    apr_int32_t i;
+    if(s == NULL) return 0;
+    for(i = 0; i < max; i++) if(s[i] == '\0') return i;
+    return max;
+}
+
+static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, SFLHTTP_method method, apr_uint32_t proto_num, const char *uri, const char *host, const char *referrer, const char *useragent, const char *authuser, const char *mimetype, apr_uint64_t bytes, apr_uint32_t duration_uS, apr_uint32_t status)
 {
     
     SFL_FLOW_SAMPLE_TYPE fs = { 0 };
@@ -335,17 +350,17 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
     httpElem.flowType.http.method = method;
     httpElem.flowType.http.protocol = proto_num;
     httpElem.flowType.http.uri.str = uri;
-    httpElem.flowType.http.uri.len = (uri ? urilen : 0);
+    httpElem.flowType.http.uri.len = my_strnlen(uri, SFLHTTP_MAX_URI_LEN);
     httpElem.flowType.http.host.str = host;
-    httpElem.flowType.http.host.len = (host ? hostlen : 0);
+    httpElem.flowType.http.host.len = my_strnlen(host, SFLHTTP_MAX_HOST_LEN);
     httpElem.flowType.http.referrer.str = referrer;
-    httpElem.flowType.http.referrer.len = (referrer ? referrerlen : 0);
+    httpElem.flowType.http.referrer.len = my_strnlen(referrer, SFLHTTP_MAX_REFERRER_LEN);
     httpElem.flowType.http.useragent.str = useragent;
-    httpElem.flowType.http.useragent.len = (useragent ? useragentlen : 0);
+    httpElem.flowType.http.useragent.len = my_strnlen(useragent, SFLHTTP_MAX_USERAGENT_LEN);
     httpElem.flowType.http.authuser.str = authuser;
-    httpElem.flowType.http.authuser.len = (authuser ? authuserlen : 0);
+    httpElem.flowType.http.authuser.len = my_strnlen(authuser, SFLHTTP_MAX_AUTHUSER_LEN);
     httpElem.flowType.http.mimetype.str = mimetype;
-    httpElem.flowType.http.mimetype.len = (mimetype ? mimetypelen : 0);
+    httpElem.flowType.http.mimetype.len = my_strnlen(mimetype, SFLHTTP_MAX_MIMETYPE_LEN);
     httpElem.flowType.http.bytes = bytes;
     httpElem.flowType.http.uS = duration_uS;
     httpElem.flowType.http.status = status;
@@ -415,10 +430,10 @@ Discard everything else.
 
 static bool_t sfwb_lookupAddress(char *name, SFLAddress *addr, apr_pool_t *configPool)
 {
-    int rc;
+    apr_status_t rc;
     apr_sockaddr_t *sa = NULL;
     apr_pool_t *pool = NULL;
-    int ans = false;
+    bool_t ans = false;
 
     if(name == NULL) return false;
 
@@ -458,7 +473,7 @@ static bool_t sfwb_lookupAddress(char *name, SFLAddress *addr, apr_pool_t *confi
   read or re-read the sFlow config
 */
 
-static bool_t sfwb_syntaxOK(SFWBConfig *cfg, uint32_t line, uint32_t tokc, uint32_t tokcMin, uint32_t tokcMax, char *syntax) {
+static bool_t sfwb_syntaxOK(SFWBConfig *cfg, apr_uint32_t line, apr_uint32_t tokc, apr_uint32_t tokcMin, apr_uint32_t tokcMax, char *syntax) {
     if(tokc < tokcMin || tokc > tokcMax) {
         cfg->error = true;
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "syntax error on line %u: expected %s", line, syntax);
@@ -467,16 +482,16 @@ static bool_t sfwb_syntaxOK(SFWBConfig *cfg, uint32_t line, uint32_t tokc, uint3
     return true;
 }
 
-static void sfwb_syntaxError(SFWBConfig *cfg, uint32_t line, char *msg) {
+static void sfwb_syntaxError(SFWBConfig *cfg, apr_uint32_t line, char *msg) {
     cfg->error = true;
     ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "syntax error on line %u: %s", line, msg);
 }    
 
 static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
 {
-    uint32_t rev_start = 0;
-    uint32_t rev_end = 0;
-    int rc;
+    apr_uint32_t rev_start = 0;
+    apr_uint32_t rev_end = 0;
+    apr_status_t rc;
     apr_pool_t *pool;
 
     /* create a sub-pool to allocate this new config from */
@@ -496,11 +511,11 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
         return NULL;
     }
     char line[SFWB_MAX_LINELEN+1];
-    uint32_t lineNo = 0;
+    apr_uint32_t lineNo = 0;
     char *tokv[5];
-    uint32_t tokc;
+    apr_uint32_t tokc;
     while(fgets(line, SFWB_MAX_LINELEN, cfg)) {
-        int i;
+        apr_int32_t i;
         char *p = line;
         lineNo++;
         /* comments start with '#' */
@@ -510,7 +525,7 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
         /* syntax error. */
         tokc = 0;
         for(i = 0; i < 5; i++) {
-            size_t len;
+            apr_size_t len;
             p += strspn(p, SFWB_SEPARATORS);
             if((len = strcspn(p, SFWB_SEPARATORS)) == 0) break;
             tokv[tokc++] = p;
@@ -569,8 +584,8 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
             else if(strcasecmp(tokv[0], "collector") == 0
                     && sfwb_syntaxOK(config, lineNo, tokc, 2, 4, "collector=<IP address>[ <port>[ <priority>]]")) {
                 if(config->num_collectors < SFWB_MAX_COLLECTORS) {
-                    uint32_t i = config->num_collectors++;
-                    uint32_t port = tokc >= 3 ? strtol(tokv[2], NULL, 0) : 6343;
+                    apr_uint32_t i = config->num_collectors++;
+                    apr_uint32_t port = tokc >= 3 ? strtol(tokv[2], NULL, 0) : 6343;
                     config->collectors[i].priority = tokc >= 4 ? strtol(tokv[3], NULL, 0) : 0;
                     if((rc = apr_sockaddr_info_get(&config->collectors[i].sa,
                                                    tokv[1],
@@ -639,7 +654,7 @@ static void sfwb_apply_config(SFWB *sm, SFWBConfig *config, server_rec *s)
 */
         
 apr_time_t configModified(SFWB *sm, server_rec *s) {
-    int rc;
+    apr_status_t rc;
     apr_finfo_t configFileInfo;
     apr_pool_t *p;
     apr_time_t mtime = 0;
@@ -674,7 +689,7 @@ void sflow_tick(SFWB *sm, server_rec *s) {
         }
         else if(modTime != sm->configFile_modTime) {
             /* config file modified */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "config file changed <%s> t=%lld", sm->configFile, modTime);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "config file changed <%s> t=%u", sm->configFile, (apr_int32_t)modTime);
             SFWBConfig *newConfig = sfwb_readConfig(sm, s);
             if(newConfig) {
                 /* config OK - apply it */
@@ -701,7 +716,7 @@ void sflow_tick(SFWB *sm, server_rec *s) {
 
 static void sflow_init(SFWB *sm, server_rec *s)
 {
-    int rc;
+    apr_status_t rc;
 
     if(sm->configFile == NULL) {
         sm->configFile = SFWB_DEFAULT_CONFIGFILE;
@@ -735,7 +750,7 @@ static void sflow_init(SFWB *sm, server_rec *s)
         /* initialize the agent with it's address, bootime, callbacks etc. */
         sfl_agent_init(sm->agent,
                        &sm->config->agentIP,
-                       getpid(), /* subAgentId */
+                       0, /* subAgentId */
                        sm->currentTime,
                        sm->currentTime,
                        sm,
@@ -786,7 +801,9 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 {
     apr_status_t rc;
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u\n", getpid());
+#ifdef SFWB_DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u", getpid());
+#endif
     
     /* read with timeout just under a second so that the sflow_tick can be issued every second.*/
     if((rc = apr_file_pipe_timeout_set(sm->pipe_read, 900000 /* uS */)) != APR_SUCCESS) {
@@ -805,11 +822,11 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         }
 
         /* read a message from the pipe (or time out) */
-        uint32_t msg[PIPE_BUF / sizeof(uint32_t)];
+        apr_uint32_t msg[PIPE_BUF / sizeof(apr_uint32_t)];
 
         /* just read the length and type first */
-        size_t hdrBytes = 12;
-        size_t hdrBytesRead = 0;
+        apr_size_t hdrBytes = 12;
+        apr_size_t hdrBytesRead = 0;
         rc = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
         if(rc != APR_SUCCESS && !(APR_STATUS_IS_TIMEUP(rc))) {
             ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
@@ -821,20 +838,20 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             if(hdrBytesRead != hdrBytes) break;
 
             /* now read the rest */
-            size_t msgBytes = msg[0];
-            uint32_t msgType = msg[1];
-            uint32_t msgId = msg[2];
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - msgType/id = %u/%u msgBytes=%u\n",
+            apr_size_t msgBytes = msg[0];
+            apr_uint32_t msgType = msg[1];
+            apr_uint32_t msgId = msg[2];
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - msgType/id = %u/%u msgBytes=%u",
                          msgType,
-                         msgId,
-                         msgBytes);
+                         (apr_uint32_t)msgId,
+                         (apr_uint32_t)msgBytes);
 
             if(msgType != SFLCOUNTERS_SAMPLE && msgType != SFLFLOW_SAMPLE) break;
 
             if(msgBytes > PIPE_BUF) break;
 
-            size_t bodyBytes = msgBytes - hdrBytes;
-            size_t bodyBytesRead = 0;
+            apr_size_t bodyBytes = msgBytes - hdrBytes;
+            apr_size_t bodyBytesRead = 0;
             if((rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead)) != APR_SUCCESS) {
                 ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
                 return rc;
@@ -842,11 +859,11 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 
             if(bodyBytesRead != bodyBytes) break;
 
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - bodyBytes read=%u\n", bodyBytesRead);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - bodyBytes read=%u", (apr_uint32_t)bodyBytesRead);
 
             /* we may not have initialized the agent yet,  so the first few samples may end up being ignored */
             if(sm->sampler) {
-                uint32_t *datap = msg;
+                apr_uint32_t *datap = msg;
                 if(msgType == SFLCOUNTERS_SAMPLE && msgId == SFLCOUNTERS_HTTP) {
                     /* counter block */
                     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
@@ -874,7 +891,7 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
                     sm->sampler->dropEvents += *datap++;
                     /* next we have a flow sample that we can encode straight into the output,  but we have to put it */
                     /* through our sampler object so that we get the right sequence numbers, pools and data-source ids. */
-                    uint32_t sampleBytes = (msg + (bodyBytesRead>>2) - datap) << 2;
+                    apr_uint32_t sampleBytes = (msg + (bodyBytesRead>>2) - datap) << 2;
                     sfl_sampler_writeEncodedFlowSample(sm->sampler, (char *)datap, sampleBytes);
                 }
             }
@@ -882,7 +899,7 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
     }
 
     /* We only get here if there was an unexpected message error that caused us to break out of the loop above */
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error\n");
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error");
     return APR_CHILD_DONE;
 }
 
@@ -895,7 +912,9 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     apr_status_t rc;
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master - pid=%u\n", getpid());
+#ifdef SFWB_DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master - pid=%u", getpid());
+#endif
 
     /* create the pipe that the child processes will use to send samples to the master */
     /* wanted to use apr_file_pipe_create_ex(...APR_FULL_NONBLOCK..) but it seems to be a new addition */
@@ -958,10 +977,10 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
 
 static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 {
-    int rc;
+    apr_status_t rc;
     SFWB *sm = apr_pcalloc(p, sizeof(SFWB));
 #ifdef SFWB_DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "create_sflow_config - pid=%u,tid=%u\n", getpid(), MYGETTID);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "create_sflow_config - pid=%u,tid=%u", getpid(), MYGETTID);
 #endif
     sm->configFile = SFWB_DEFAULT_CONFIGFILE;
 
@@ -987,7 +1006,7 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
     SFWB *sm = GET_CONFIG_DATA(s);
 
 #ifdef SFWB_DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u\n", getpid(),MYGETTID);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u", getpid(),MYGETTID);
 #endif
 
     /* All post_config hooks are called twice, we're only interested in the second call. */
@@ -1002,10 +1021,10 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 #ifdef SFWB_DEBUG
         if((rc = ap_mpm_query(AP_MPMQ_IS_THREADED, &sm->mpm_threaded)) == APR_SUCCESS) {
             /* We could use this information to decided whether to create the mutex in each child */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u\n", sm->mpm_threaded);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u", sm->mpm_threaded);
         }
         else {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed\n");
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed");
         }
 #endif
         
@@ -1021,7 +1040,7 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
   -----------------___________________________------------------
 */
 
-static void *sfwb_childcb_alloc(void *magic, SFLAgent *agent, size_t bytes)
+static void *sfwb_childcb_alloc(void *magic, SFLAgent *agent, apr_size_t bytes)
 {
     SFWB *sm = (SFWB *)magic;
     return apr_pcalloc(sm->child->childPool, bytes);
@@ -1045,10 +1064,10 @@ static void sfwb_childcb_error(void *magic, SFLAgent *agent, char *msg)
 
 static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
-    int rc;
+    apr_status_t rc;
     SFWB *sm = GET_CONFIG_DATA(s);
 #ifdef SFWB_DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u\n", getpid(),MYGETTID);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u", getpid(),MYGETTID);
 #endif
     /* create my own private state, and hang it off the shared state */
     SFWBChild *child = (SFWBChild *)apr_pcalloc(p, sizeof(SFWBChild));
@@ -1067,7 +1086,7 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
            whether it is needed or not. */
 
         if((rc = apr_thread_mutex_create(&child->mutex, APR_THREAD_MUTEX_DEFAULT, p)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_init_child - apr_thread_mutex_create() failed\n");
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_init_child - apr_thread_mutex_create() failed");
         }
     }
 
@@ -1077,7 +1096,7 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
     SFLAddress myIP = { 0 }; /* blank address */
     sfl_agent_init(child->agent,
                    &myIP,
-                   getpid(), /* subAgentId */
+                   1, /* subAgentId */
                    sm->currentTime,
                    sm->currentTime,
                    sm,
@@ -1094,7 +1113,7 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
     child->sampler = sfl_agent_addSampler(child->agent, &dsi);
     sfl_sampler_set_sFlowFsReceiver(child->sampler, 1 /* receiver index*/);
     /* seed the random number generator */
-    sfl_random_init(getpid());
+    sfl_random_init(apr_time_now() /*getpid()*/);
     /* we'll pick up the sampling_rate later. Don't want to insist
      * on it being present at startup - don't want to delay the
      * startup if we can avoid it.  Just set it to 0 so we check for
@@ -1178,20 +1197,22 @@ static SFLHTTP_method methodNumberLookup(int method)
   -----------------_____________________________------------------
 */
 
-static void send_msg_to_master(request_rec *r, SFWB *sm, void *msg, uint32_t msgBytes, char *msgDescr)
+static void send_msg_to_master(request_rec *r, SFWB *sm, void *msg, apr_size_t msgBytes, char *msgDescr)
 {
     apr_status_t rc;
+    apr_size_t msgBytesWritten;
+
     if(msgBytes > PIPE_BUF) {
         /* if msgBytes greater than PIPE_BUF the pipe write will not be atomic. Should never happen,
            but can't risk it, since we are relying on this as the synchronization mechanism between processes */
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "msgBytes=%u exceeds %u-byte limit for atomic write on pipe (%s)",
-                      msgBytes,
+                      (apr_uint32_t)msgBytes,
                       PIPE_BUF,
                       msgDescr);
         /* this counts as an sFlow drop-event */
         sm->child->sampler->dropEvents++;
     }
-    else if((rc = apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytes)) != APR_SUCCESS) {
+    else if((rc = apr_file_write_full(sm->pipe_write, msg, msgBytes, &msgBytesWritten)) != APR_SUCCESS) {
         
         /* this counts as an sFlow drop-event too */
         sm->child->sampler->dropEvents++;
@@ -1217,8 +1238,6 @@ static void send_msg_to_master(request_rec *r, SFWB *sm, void *msg, uint32_t msg
   -----------------_____________________________------------------
 */
 
-static int my_strlen(const char *s) { return s ? strlen(s) : 0; }
-
 static int sflow_multi_log_transaction(request_rec *r)
 {
     SFWB *sm = GET_CONFIG_DATA(r->server);
@@ -1231,7 +1250,7 @@ static int sflow_multi_log_transaction(request_rec *r)
 
     apr_time_t now_uS = apr_time_now();
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)", child->sampler->skip);
-    uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
+    apr_uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
 
     /* The simplest thing here is just to mutex-lock this whole step.
        Most times through here we do very little anyway.  The alternative
@@ -1269,7 +1288,7 @@ static int sflow_multi_log_transaction(request_rec *r)
         else if(unlikely(sfl_sampler_takeSample(child->sampler))) {
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow take sample: r->method_number=%u", r->method_number);
             /* point to the start of the datagram */
-            uint32_t *msg = child->receiver->sampleCollector.datap;
+            apr_uint32_t *msg = child->receiver->sampleCollector.datap;
             /* msglen, msgType, sample pool and drops */
             sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
             sfl_receiver_put32(child->receiver, SFLFLOW_SAMPLE);
@@ -1291,12 +1310,12 @@ static int sflow_multi_log_transaction(request_rec *r)
                               r->connection,
                               method,
                               r->proto_num,
-                              r->uri, my_strlen(r->uri), /* r->the_request ? */
-                              r->hostname, my_strlen(r->hostname), /* r->server->server_hostname ?*/
-                              referer, my_strlen(referer),
-                              useragent, my_strlen(useragent),
-                              r->user, my_strlen(r->user),
-                              contentType, my_strlen(contentType),
+                              r->uri, /* r->the_request ? */
+                              r->hostname, /* r->server->server_hostname ?*/
+                              referer,
+                              useragent,
+                              r->user,
+                              contentType,
                               r->bytes_sent,
                               now_uS - r->request_time,
                               r->status);
@@ -1314,9 +1333,9 @@ static int sflow_multi_log_transaction(request_rec *r)
     
         if((now_uS - child->lastTickTime) > SFWB_CHILD_TICK_US) {
             child->lastTickTime = now_uS;
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "child tick - sending counters\n");
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "child tick - sending counters");
             /* point to the start of the datagram */
-            uint32_t *msg = child->receiver->sampleCollector.datap;
+            apr_uint32_t *msg = child->receiver->sampleCollector.datap;
             /* msglen, msgType, msgId */
             sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
             sfl_receiver_put32(child->receiver, SFLCOUNTERS_SAMPLE);
