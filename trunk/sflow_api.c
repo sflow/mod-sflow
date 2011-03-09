@@ -2,13 +2,20 @@
 /* Copyright (c) 2002-2010 InMon Corp. Licensed under the terms of the InMon sFlow licence: */
 /* http://www.inmon.com/technology/sflowlicense.txt */
 
+#include "apr.h"
+#include "apr_strings.h"
+
+#define APR_WANT_BYTEFUNC   /* htonl */
+#define ARP_WANT_MEMFUNC    /* memcpy */
+#include "apr_want.h"
+
 #include "sflow_api.h"
 
 /* ===================================================*/
 /* ===================== AGENT =======================*/
 
 
-static void * sflAlloc(SFLAgent *agent, size_t bytes);
+static void * sflAlloc(SFLAgent *agent, apr_size_t bytes);
 static void sflFree(SFLAgent *agent, void *obj);
 static void sfl_agent_jumpTableAdd(SFLAgent *agent, SFLSampler *sampler);
 static void sfl_agent_jumpTableRemove(SFLAgent *agent, SFLSampler *sampler);
@@ -18,16 +25,16 @@ static void sfl_agent_jumpTableRemove(SFLAgent *agent, SFLSampler *sampler);
   -----------------___________________________------------------
 */
 
-static void * sflAlloc(SFLAgent *agent, size_t bytes)
+static void * sflAlloc(SFLAgent *agent, apr_size_t bytes)
 {
-    if(agent->allocFn) return (*agent->allocFn)(agent->magic, agent, bytes);
-    else return SFL_ALLOC(bytes);
+    /* just assume we were given an allocFn */
+    return (*agent->allocFn)(agent->magic, agent, bytes);
 }
 
 static void sflFree(SFLAgent *agent, void *obj)
 {
-    if(agent->freeFn) (*agent->freeFn)(agent->magic, agent, obj);
-    else SFL_FREE(obj);
+    /* just assume we were given an allocFn */
+    (*agent->freeFn)(agent->magic, agent, obj);
 }
   
 /*_________________---------------------------__________________
@@ -39,27 +46,8 @@ static void sflFree(SFLAgent *agent, void *obj)
 void sfl_agent_error(SFLAgent *agent, char *modName, char *msg)
 {
     char errm[MAX_ERRMSG_LEN];
-    sprintf(errm, "sfl_agent_error: %s: %s\n", modName, msg);
+    apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_agent_error: %s: %s\n", modName, msg);
     if(agent->errorFn) (*agent->errorFn)(agent->magic, agent, errm);
-    else {
-        fprintf(stderr, "%s\n", errm);
-        fflush(stderr);
-    }
-}
-
-void sfl_agent_sysError(SFLAgent *agent, char *modName, char *msg)
-{
-    char errm[MAX_ERRMSG_LEN];
-    sprintf(errm, "sfl_agent_sysError: %s: %s (errno = %d - %s)\n",
-            modName,
-            msg,
-            errno,
-            strerror(errno));
-    if(agent->errorFn) (*agent->errorFn)(agent->magic, agent, errm);
-    else {
-        fprintf(stderr, "%s\n", errm);
-        fflush(stderr);
-    }
 }
 
 /*________________--------------------------__________________
@@ -69,9 +57,9 @@ void sfl_agent_sysError(SFLAgent *agent, char *modName, char *msg)
 
 void sfl_agent_init(SFLAgent *agent,
                     SFLAddress *myIP, /* IP address of this agent in net byte order */
-                    uint32_t subId,  /* agent_sub_id */
-                    time_t bootTime,  /* agent boot time */
-                    time_t now,       /* time now */
+                    apr_uint32_t subId,  /* agent_sub_id */
+                    apr_time_t bootTime,  /* agent boot time */
+                    apr_time_t now,       /* time now */
                     void *magic,      /* ptr to pass back in logging and alloc fns */
                     allocFn_t allocFn,
                     freeFn_t freeFn,
@@ -90,16 +78,6 @@ void sfl_agent_init(SFLAgent *agent,
     agent->freeFn = freeFn;
     agent->errorFn = errorFn;
     agent->sendFn = sendFn;
-
-#ifdef SFLOW_DO_SOCKET  
-    if(sendFn == NULL) {
-        /* open the socket - really need one for v4 and another for v6? */
-        if((agent->receiverSocket4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
-            sfl_agent_sysError(agent, "agent", "IPv4 socket open failed");
-        if((agent->receiverSocket6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) == -1)
-            sfl_agent_sysError(agent, "agent", "IPv6 socket open failed");
-    }
-#endif
 }
 
 /*_________________---------------------------__________________
@@ -136,12 +114,6 @@ void sfl_agent_release(SFLAgent *agent)
         rcv = nextRcv;
     }
     agent->receivers = NULL;
-
-#ifdef SFLOW_DO_SOCKET
-    /* close the sockets */
-    if(agent->receiverSocket4 > 0) close(agent->receiverSocket4);
-    if(agent->receiverSocket6 > 0) close(agent->receiverSocket6);
-#endif
 }
 
 /*_________________---------------------------__________________
@@ -149,7 +121,7 @@ void sfl_agent_release(SFLAgent *agent)
   -----------------___________________________------------------
 */
 
-void sfl_agent_tick(SFLAgent *agent, time_t now)
+void sfl_agent_tick(SFLAgent *agent, apr_time_t now)
 {
     SFLReceiver *rcv;
     SFLSampler *sm;
@@ -321,7 +293,7 @@ int sfl_agent_removePoller(SFLAgent *agent, SFLDataSource_instance *pdsi)
 
 static void sfl_agent_jumpTableAdd(SFLAgent *agent, SFLSampler *sampler)
 {
-    uint32_t hashIndex = SFL_DS_INDEX(sampler->dsi) % SFL_HASHTABLE_SIZ;
+    apr_uint32_t hashIndex = SFL_DS_INDEX(sampler->dsi) % SFL_HASHTABLE_SIZ;
     sampler->hash_nxt = agent->jumpTable[hashIndex];
     agent->jumpTable[hashIndex] = sampler;
 }
@@ -333,7 +305,7 @@ static void sfl_agent_jumpTableAdd(SFLAgent *agent, SFLSampler *sampler)
 
 static void sfl_agent_jumpTableRemove(SFLAgent *agent, SFLSampler *sampler)
 {
-    uint32_t hashIndex = SFL_DS_INDEX(sampler->dsi) % SFL_HASHTABLE_SIZ;
+    apr_uint32_t hashIndex = SFL_DS_INDEX(sampler->dsi) % SFL_HASHTABLE_SIZ;
     SFLSampler *search = agent->jumpTable[hashIndex], *prev = NULL;
     for( ; search != NULL; prev = search, search = search->hash_nxt) if(search == sampler) break;
     if(search) {
@@ -356,7 +328,7 @@ static void sfl_agent_jumpTableRemove(SFLAgent *agent, SFLSampler *sampler)
   the same flowSample to multiple samplers.
 */
 
-SFLSampler *sfl_agent_getSamplerByIfIndex(SFLAgent *agent, uint32_t ifIndex)
+SFLSampler *sfl_agent_getSamplerByIfIndex(SFLAgent *agent, apr_uint32_t ifIndex)
 {
     SFLSampler *search = agent->jumpTable[ifIndex % SFL_HASHTABLE_SIZ];
     for( ; search != NULL; search = search->hash_nxt) if(SFL_DS_INDEX(search->dsi) == ifIndex) break;
@@ -400,11 +372,11 @@ SFLPoller *sfl_agent_getPoller(SFLAgent *agent, SFLDataSource_instance *pdsi)
   -----------------___________________________------------------
 */
 
-SFLReceiver *sfl_agent_getReceiver(SFLAgent *agent, uint32_t receiverIndex)
+SFLReceiver *sfl_agent_getReceiver(SFLAgent *agent, apr_uint32_t receiverIndex)
 {
     SFLReceiver *rcv;
 
-    uint32_t rcvIdx = 0;
+    apr_uint32_t rcvIdx = 0;
     for( rcv = agent->receivers; rcv != NULL; rcv = rcv->nxt)
         if(receiverIndex == ++rcvIdx) return rcv;
 
@@ -443,7 +415,7 @@ SFLPoller *sfl_agent_getNextPoller(SFLAgent *agent, SFLDataSource_instance *pdsi
   -----------------___________________________------------------
 */
 
-SFLReceiver *sfl_agent_getNextReceiver(SFLAgent *agent, uint32_t receiverIndex)
+SFLReceiver *sfl_agent_getNextReceiver(SFLAgent *agent, apr_uint32_t receiverIndex)
 {
     return sfl_agent_getReceiver(agent, receiverIndex + 1);
 }
@@ -462,7 +434,7 @@ void sfl_agent_resetReceiver(SFLAgent *agent, SFLReceiver *receiver)
 
     /* tell samplers and pollers to stop sending to this receiver */
     /* first get his receiverIndex */
-    uint32_t rcvIdx = 0;
+    apr_uint32_t rcvIdx = 0;
     for( rcv = agent->receivers; rcv != NULL; rcv = rcv->nxt) {
         rcvIdx++; /* thanks to Diego Valverde for pointing out this bugfix */
         if(rcv == receiver) {
@@ -529,11 +501,11 @@ static void resetSampler(SFLSampler *sampler)
   _________________      MIB access           __________________
   -----------------___________________________------------------
 */
-uint32_t sfl_sampler_get_sFlowFsReceiver(SFLSampler *sampler) {
+apr_uint32_t sfl_sampler_get_sFlowFsReceiver(SFLSampler *sampler) {
     return sampler->sFlowFsReceiver;
 }
 
-void sfl_sampler_set_sFlowFsReceiver(SFLSampler *sampler, uint32_t sFlowFsReceiver) {
+void sfl_sampler_set_sFlowFsReceiver(SFLSampler *sampler, apr_uint32_t sFlowFsReceiver) {
     sampler->sFlowFsReceiver = sFlowFsReceiver;
     if(sFlowFsReceiver == 0) resetSampler(sampler);
     else {
@@ -542,21 +514,21 @@ void sfl_sampler_set_sFlowFsReceiver(SFLSampler *sampler, uint32_t sFlowFsReceiv
     }
 }
 
-uint32_t sfl_sampler_get_sFlowFsPacketSamplingRate(SFLSampler *sampler) {
+apr_uint32_t sfl_sampler_get_sFlowFsPacketSamplingRate(SFLSampler *sampler) {
     return sampler->sFlowFsPacketSamplingRate;
 }
 
-void sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, uint32_t sFlowFsPacketSamplingRate) {
+void sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, apr_uint32_t sFlowFsPacketSamplingRate) {
     sampler->sFlowFsPacketSamplingRate = sFlowFsPacketSamplingRate;
     /* initialize the skip count too */
     sampler->skip = sFlowFsPacketSamplingRate ? sfl_random(sFlowFsPacketSamplingRate) : 0;
 }
 
-uint32_t sfl_sampler_get_sFlowFsMaximumHeaderSize(SFLSampler *sampler) {
+apr_uint32_t sfl_sampler_get_sFlowFsMaximumHeaderSize(SFLSampler *sampler) {
     return sampler->sFlowFsMaximumHeaderSize;
 }
 
-void sfl_sampler_set_sFlowFsMaximumHeaderSize(SFLSampler *sampler, uint32_t sFlowFsMaximumHeaderSize) {
+void sfl_sampler_set_sFlowFsMaximumHeaderSize(SFLSampler *sampler, apr_uint32_t sFlowFsMaximumHeaderSize) {
     sampler->sFlowFsMaximumHeaderSize = sFlowFsMaximumHeaderSize;
 }
 
@@ -564,15 +536,15 @@ void sfl_sampler_set_sFlowFsMaximumHeaderSize(SFLSampler *sampler, uint32_t sFlo
    threshold it will automatically back off the sampling rate. A value of 0 disables the
    mechanism */
 
-void sfl_sampler_set_backoffThreshold(SFLSampler *sampler, uint32_t samplesPerSecond) {
+void sfl_sampler_set_backoffThreshold(SFLSampler *sampler, apr_uint32_t samplesPerSecond) {
     sampler->backoffThreshold = samplesPerSecond;
 }
 
-uint32_t sfl_sampler_get_backoffThreshold(SFLSampler *sampler) {
+apr_uint32_t sfl_sampler_get_backoffThreshold(SFLSampler *sampler) {
     return sampler->backoffThreshold;
 }
 
-uint32_t sfl_sampler_get_samplesLastTick(SFLSampler *sampler) {
+apr_uint32_t sfl_sampler_get_samplesLastTick(SFLSampler *sampler) {
     return sampler->samplesLastTick;
 }
 
@@ -590,7 +562,7 @@ void sfl_sampler_resetFlowSeqNo(SFLSampler *sampler) { sampler->flowSampleSeqNo 
   -----------------___________________________------------------
 */
 
-void sfl_sampler_tick(SFLSampler *sampler, time_t now)
+void sfl_sampler_tick(SFLSampler *sampler, apr_time_t now)
 {
     if(sampler->backoffThreshold && sampler->samplesThisTick > sampler->backoffThreshold) {
         /* automatic backoff.  If using hardware sampling then this is where you have to */
@@ -637,7 +609,7 @@ void sfl_sampler_writeFlowSample(SFLSampler *sampler, SFL_FLOW_SAMPLE_TYPE *fs)
   -----------------_____________________________________------------------
 */
 
-void sfl_sampler_writeEncodedFlowSample(SFLSampler *sampler, char *xdrBytes, uint32_t len)
+void sfl_sampler_writeEncodedFlowSample(SFLSampler *sampler, char *xdrBytes, apr_uint32_t len)
 {
     SFL_FLOW_SAMPLE_TYPE fs = { 0 };
     sampler->samplesThisTick++;
@@ -662,14 +634,14 @@ void sfl_sampler_writeEncodedFlowSample(SFLSampler *sampler, char *xdrBytes, uin
   Gerhard's generator
 */
 
-static uint32_t SFLRandom = 1;
+static apr_uint32_t SFLRandom = 1;
 
-uint32_t sfl_random(uint32_t lim) {
+apr_uint32_t sfl_random(apr_uint32_t lim) {
     SFLRandom = ((SFLRandom * 32719) + 3) % 32749;
     return ((SFLRandom % lim) + 1);
 } 
 
-void sfl_random_init(uint32_t seed) {
+void sfl_random_init(apr_uint32_t seed) {
     SFLRandom = seed;
 } 
 
@@ -742,11 +714,11 @@ static void resetPoller(SFLPoller *poller)
   _________________      MIB access           __________________
   -----------------___________________________------------------
 */
-uint32_t sfl_poller_get_sFlowCpReceiver(SFLPoller *poller) {
+apr_uint32_t sfl_poller_get_sFlowCpReceiver(SFLPoller *poller) {
     return poller->sFlowCpReceiver;
 }
 
-void sfl_poller_set_sFlowCpReceiver(SFLPoller *poller, uint32_t sFlowCpReceiver) {
+void sfl_poller_set_sFlowCpReceiver(SFLPoller *poller, apr_uint32_t sFlowCpReceiver) {
     poller->sFlowCpReceiver = sFlowCpReceiver;
     if(sFlowCpReceiver == 0) resetPoller(poller);
     else {
@@ -755,11 +727,11 @@ void sfl_poller_set_sFlowCpReceiver(SFLPoller *poller, uint32_t sFlowCpReceiver)
     }
 }
 
-uint32_t sfl_poller_get_sFlowCpInterval(SFLPoller *poller) {
-    return (uint32_t)poller->sFlowCpInterval;
+apr_uint32_t sfl_poller_get_sFlowCpInterval(SFLPoller *poller) {
+    return (apr_uint32_t)poller->sFlowCpInterval;
 }
 
-void sfl_poller_set_sFlowCpInterval(SFLPoller *poller, uint32_t sFlowCpInterval) {
+void sfl_poller_set_sFlowCpInterval(SFLPoller *poller, apr_uint32_t sFlowCpInterval) {
     poller->sFlowCpInterval = sFlowCpInterval;
     /* Set the countersCountdown to be a randomly selected value between 1 and
        sFlowCpInterval. That way the counter polling would be desynchronised
@@ -780,7 +752,7 @@ void sfl_poller_resetCountersSeqNo(SFLPoller *poller) {  poller->countersSampleS
   -----------------___________________________------------------
 */
 
-void sfl_poller_tick(SFLPoller *poller, time_t now)
+void sfl_poller_tick(SFLPoller *poller, apr_time_t now)
 {
     if(poller->countersCountdown == 0) return; /* counters retrieval was not enabled */
     if(poller->sFlowCpReceiver == 0) return;
@@ -828,12 +800,9 @@ void sfl_poller_writeCountersSample(SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE 
 static void resetSampleCollector(SFLReceiver *receiver);
 static void sendSample(SFLReceiver *receiver);
 static void receiverError(SFLReceiver *receiver, char *errm);
-static void putNet32(SFLReceiver *receiver, uint32_t val);
+static void putNet32(SFLReceiver *receiver, apr_uint32_t val);
 static void putAddress(SFLReceiver *receiver, SFLAddress *addr);
 static void putOpaque(SFLReceiver *receiver, char *val, int len);
-#ifdef SFLOW_DO_SOCKET
-static void initSocket(SFLReceiver *receiver);
-#endif
 
 /*_________________--------------------------__________________
   _________________    sfl_receiver_init     __________________
@@ -851,11 +820,6 @@ void sfl_receiver_init(SFLReceiver *receiver, SFLAgent *agent)
     /* set defaults */
     receiver->sFlowRcvrMaximumDatagramSize = SFL_DEFAULT_DATAGRAM_SIZE;
     receiver->sFlowRcvrPort = SFL_DEFAULT_COLLECTOR_PORT;
-
-#ifdef SFLOW_DO_SOCKET
-    /* initialize the socket address */
-    initSocket(receiver);
-#endif
 
     /* prepare to receive the first sample */
     resetSampleCollector(receiver);
@@ -875,27 +839,6 @@ static void resetReceiver(SFLReceiver *receiver) {
     sfl_receiver_init(receiver, receiver->agent);
 }
 
-#ifdef SFLOW_DO_SOCKET
-/*_________________---------------------------__________________
-  _________________      initSocket           __________________
-  -----------------___________________________------------------
-*/
-
-static void initSocket(SFLReceiver *receiver) {
-    if(receiver->sFlowRcvrAddress.type == SFLADDRESSTYPE_IP_V6) {
-        struct sockaddr_in6 *sa6 = &receiver->receiver6;
-        sa6->sin6_port = htons((uint16_t)receiver->sFlowRcvrPort);
-        sa6->sin6_family = AF_INET6;
-        sa6->sin6_addr = receiver->sFlowRcvrAddress.address.ip_v6;
-    }
-    else {
-        struct sockaddr_in *sa4 = &receiver->receiver4;
-        sa4->sin_port = htons((uint16_t)receiver->sFlowRcvrPort);
-        sa4->sin_family = AF_INET;
-        sa4->sin_addr = receiver->sFlowRcvrAddress.address.ip_v4;
-    }
-}
-#endif
 
 /*_________________----------------------------------------_____________
   _________________          MIB Vars                      _____________
@@ -912,17 +855,17 @@ void sfl_receiver_set_sFlowRcvrOwner(SFLReceiver *receiver, char *sFlowRcvrOwner
         resetReceiver(receiver);
     }
 }
-time_t sfl_receiver_get_sFlowRcvrTimeout(SFLReceiver *receiver) {
+apr_time_t sfl_receiver_get_sFlowRcvrTimeout(SFLReceiver *receiver) {
     return receiver->sFlowRcvrTimeout;
 }
-void sfl_receiver_set_sFlowRcvrTimeout(SFLReceiver *receiver, time_t sFlowRcvrTimeout) {
+void sfl_receiver_set_sFlowRcvrTimeout(SFLReceiver *receiver, apr_time_t sFlowRcvrTimeout) {
     receiver->sFlowRcvrTimeout =sFlowRcvrTimeout;
 } 
-uint32_t sfl_receiver_get_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver) {
+apr_uint32_t sfl_receiver_get_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver) {
     return receiver->sFlowRcvrMaximumDatagramSize;
 }
-void sfl_receiver_set_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver, uint32_t sFlowRcvrMaximumDatagramSize) {
-    uint32_t mdz = sFlowRcvrMaximumDatagramSize;
+void sfl_receiver_set_sFlowRcvrMaximumDatagramSize(SFLReceiver *receiver, apr_uint32_t sFlowRcvrMaximumDatagramSize) {
+    apr_uint32_t mdz = sFlowRcvrMaximumDatagramSize;
     if(mdz < SFL_MIN_DATAGRAM_SIZE) mdz = SFL_MIN_DATAGRAM_SIZE;
     receiver->sFlowRcvrMaximumDatagramSize = mdz;
 }
@@ -931,19 +874,12 @@ SFLAddress *sfl_receiver_get_sFlowRcvrAddress(SFLReceiver *receiver) {
 }
 void sfl_receiver_set_sFlowRcvrAddress(SFLReceiver *receiver, SFLAddress *sFlowRcvrAddress) {
     if(sFlowRcvrAddress) receiver->sFlowRcvrAddress = *sFlowRcvrAddress; /* structure copy */
-#ifdef SFLOW_DO_SOCKET
-    initSocket(receiver);
-#endif
 }
-uint32_t sfl_receiver_get_sFlowRcvrPort(SFLReceiver *receiver) {
+apr_uint32_t sfl_receiver_get_sFlowRcvrPort(SFLReceiver *receiver) {
     return receiver->sFlowRcvrPort;
 }
-void sfl_receiver_set_sFlowRcvrPort(SFLReceiver *receiver, uint32_t sFlowRcvrPort) {
+void sfl_receiver_set_sFlowRcvrPort(SFLReceiver *receiver, apr_uint32_t sFlowRcvrPort) {
     receiver->sFlowRcvrPort = sFlowRcvrPort;
-    /* update the socket structure */
-#ifdef SFLOW_DO_SOCKET
-    initSocket(receiver);
-#endif
 }
 
 /*_________________---------------------------__________________
@@ -951,12 +887,12 @@ void sfl_receiver_set_sFlowRcvrPort(SFLReceiver *receiver, uint32_t sFlowRcvrPor
   -----------------___________________________------------------
 */
 
-void sfl_receiver_tick(SFLReceiver *receiver, time_t now)
+void sfl_receiver_tick(SFLReceiver *receiver, apr_time_t now)
 {
     /* if there are any samples to send, flush them now */
     if(receiver->sampleCollector.numSamples > 0) sendSample(receiver);
     /* check the timeout */
-    if(receiver->sFlowRcvrTimeout && (uint32_t)receiver->sFlowRcvrTimeout != 0xFFFFFFFF) {
+    if(receiver->sFlowRcvrTimeout && (apr_uint32_t)receiver->sFlowRcvrTimeout != 0xFFFFFFFF) {
         /* count down one tick and reset if we reach 0 */
         if(--receiver->sFlowRcvrTimeout == 0) resetReceiver(receiver);
     }
@@ -967,31 +903,31 @@ void sfl_receiver_tick(SFLReceiver *receiver, time_t now)
   -----------------_____________________________------------------
 */
  
-static void put32(SFLReceiver *receiver, uint32_t val)
+static void put32(SFLReceiver *receiver, apr_uint32_t val)
 {
     *receiver->sampleCollector.datap++ = val;
 }
 
-static void putNet32(SFLReceiver *receiver, uint32_t val)
+static void putNet32(SFLReceiver *receiver, apr_uint32_t val)
 {
     *receiver->sampleCollector.datap++ = htonl(val);
 }
 
 static void putNet64(SFLReceiver *receiver, uint64_t val64)
 {
-    uint32_t *firstQuadPtr = receiver->sampleCollector.datap;
+    apr_uint32_t *firstQuadPtr = receiver->sampleCollector.datap;
     /* first copy the bytes in */
-    memcpy((u_char *)firstQuadPtr, &val64, 8);
+    memcpy((apr_byte_t *)firstQuadPtr, &val64, 8);
     if(htonl(1) != 1) {
         /* swap the bytes, and reverse the quads too */
-        uint32_t tmp = *receiver->sampleCollector.datap++;
+        apr_uint32_t tmp = *receiver->sampleCollector.datap++;
         *firstQuadPtr = htonl(*receiver->sampleCollector.datap);
         *receiver->sampleCollector.datap++ = htonl(tmp);
     }
     else receiver->sampleCollector.datap += 2;
 }
 
-static void put128(SFLReceiver *receiver, u_char *val)
+static void put128(SFLReceiver *receiver, apr_byte_t *val)
 {
     memcpy(receiver->sampleCollector.datap, val, 16);
     receiver->sampleCollector.datap += 4;
@@ -1004,7 +940,7 @@ static void putString(SFLReceiver *receiver, SFLString *s)
     receiver->sampleCollector.datap += (s->len + 3) / 4; /* pad to 4-byte boundary */
 }
 
-static uint32_t stringEncodingLength(SFLString *s) {
+static apr_uint32_t stringEncodingLength(SFLString *s) {
     /* answer in bytes,  so remember to mulitply by 4 after rounding up to nearest 4-byte boundary */
     return 4 + (((s->len + 3) / 4) * 4);
 }
@@ -1029,8 +965,8 @@ static void putOpaque(SFLReceiver *receiver, char *val, int len)
     receiver->sampleCollector.datap += ((len+3)/4);
 }
 
-static uint32_t httpOpEncodingLength(SFLSampled_http *op) {
-  uint32_t elemSiz = stringEncodingLength(&op->uri);
+static apr_uint32_t httpOpEncodingLength(SFLSampled_http *op) {
+  apr_uint32_t elemSiz = stringEncodingLength(&op->uri);
   elemSiz += stringEncodingLength(&op->host);
   elemSiz += stringEncodingLength(&op->referrer);
   elemSiz += stringEncodingLength(&op->useragent);
@@ -1065,12 +1001,12 @@ static void putSocket6(SFLReceiver *receiver, SFLExtended_socket_ipv6 *socket6) 
 static int computeFlowSampleSize(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs)
 {
     SFLFlow_sample_element *elem;
-    uint32_t elemSiz;
+    apr_uint32_t elemSiz;
 #ifdef SFL_USE_32BIT_INDEX
     uint siz = 52; /* tag, length, sequence_number, ds_class, ds_index, sampling_rate,
                       sample_pool, drops, inputFormat, input, outputFormat, output, number of elements */
 #else
-    uint32_t siz = 40; /* tag, length, sequence_number, source_id, sampling_rate,
+    apr_uint32_t siz = 40; /* tag, length, sequence_number, source_id, sampling_rate,
                           sample_pool, drops, input, output, number of elements */
 #endif
 
@@ -1087,8 +1023,8 @@ static int computeFlowSampleSize(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
         case SFLFLOW_EX_SOCKET6: elemSiz = XDRSIZ_SFLEXTENDED_SOCKET6;  break;
         default:
             {
-                char errm[128];
-                sprintf(errm, "computeFlowSampleSize(): unexpected tag (%u)", elem->tag);
+                char errm[MAX_ERRMSG_LEN];
+                apr_snprintf(errm, MAX_ERRMSG_LEN, "computeFlowSampleSize(): unexpected tag (%u)", elem->tag);
                 receiverError(receiver, errm);
                 return -1;
             }
@@ -1111,7 +1047,7 @@ int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
 {
     int packedSize;
     SFLFlow_sample_element *elem;
-    uint32_t encodingSize;
+    apr_uint32_t encodingSize;
 
     if(fs == NULL) return -1;
     if((packedSize = computeFlowSampleSize(receiver, fs)) == -1) return -1;
@@ -1184,8 +1120,8 @@ int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
             break;
         default:
             {
-                char errm[128];
-                sprintf(errm, "sfl_receiver_writeFlowSample: unexpected tag (%u)", elem->tag);
+                char errm[MAX_ERRMSG_LEN];
+                apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_receiver_writeFlowSample: unexpected tag (%u)", elem->tag);
                 receiverError(receiver, errm);
                 return -1;
             }
@@ -1194,21 +1130,21 @@ int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
     }
 
     /* sanity check */
-    encodingSize = (u_char *)receiver->sampleCollector.datap
-        - (u_char *)receiver->sampleCollector.data
+    encodingSize = (apr_byte_t *)receiver->sampleCollector.datap
+        - (apr_byte_t *)receiver->sampleCollector.data
         - receiver->sampleCollector.pktlen;
 
-    if(encodingSize != (uint32_t)packedSize) {
-        char errm[128];
-        sprintf(errm, "sfl_receiver_writeFlowSample: encoding_size(%u) != expected_size(%u)",
-                encodingSize,
-                packedSize);
+    if(encodingSize != (apr_uint32_t)packedSize) {
+        char errm[MAX_ERRMSG_LEN];
+        apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_receiver_writeFlowSample: encoding_size(%u) != expected_size(%u)",
+                     encodingSize,
+                     packedSize);
         receiverError(receiver, errm);
         return -1;
     }
       
     /* update the pktlen */
-    receiver->sampleCollector.pktlen = (u_char *)receiver->sampleCollector.datap - (u_char *)receiver->sampleCollector.data;
+    receiver->sampleCollector.pktlen = (apr_byte_t *)receiver->sampleCollector.datap - (apr_byte_t *)receiver->sampleCollector.data;
     return packedSize;
 }
 
@@ -1217,11 +1153,11 @@ int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
   -----------------______________________________________------------------
 */
 
-int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs, char *xdrBytes, uint32_t packedSize)
+int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs, char *xdrBytes, apr_uint32_t packedSize)
 {
-    uint32_t encodingSize;
-    uint32_t overrideEncodingSize;
-    uint32_t xdrHdrStrip;
+    apr_uint32_t encodingSize;
+    apr_uint32_t overrideEncodingSize;
+    apr_uint32_t xdrHdrStrip;
 
     /* check in case this one sample alone is too big for the datagram */
     if(packedSize > (int)(receiver->sFlowRcvrMaximumDatagramSize)) {
@@ -1257,8 +1193,8 @@ int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_T
     putNet32(receiver, fs->drops);
 
     /* sanity check */
-    overrideEncodingSize = (u_char *)receiver->sampleCollector.datap
-        - (u_char *)receiver->sampleCollector.data
+    overrideEncodingSize = (apr_byte_t *)receiver->sampleCollector.datap
+        - (apr_byte_t *)receiver->sampleCollector.data
         - receiver->sampleCollector.pktlen;
 
 #ifdef SFL_USE_32BIT_INDEX
@@ -1273,24 +1209,24 @@ int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_T
     receiver->sampleCollector.datap += ((packedSize - xdrHdrStrip) >> 2);
 
     /* sanity check */
-    encodingSize = (u_char *)receiver->sampleCollector.datap
-        - (u_char *)receiver->sampleCollector.data
+    encodingSize = (apr_byte_t *)receiver->sampleCollector.datap
+        - (apr_byte_t *)receiver->sampleCollector.data
         - receiver->sampleCollector.pktlen;
 
-    if(encodingSize != (uint32_t)packedSize) {
-        char errm[128];
-        sprintf(errm, "sfl_receiver_writeEncodedFlowSample: encoding_size(%u) != expected_size(%u) [overrideEncodingSize=%u xdrHeaderStrip=%u pktlen=%u]",
-                encodingSize,
-                packedSize,
-                overrideEncodingSize,
-                xdrHdrStrip,
-                receiver->sampleCollector.pktlen);
+    if(encodingSize != (apr_uint32_t)packedSize) {
+        char errm[MAX_ERRMSG_LEN];
+        apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_receiver_writeEncodedFlowSample: encoding_size(%u) != expected_size(%u) [overrideEncodingSize=%u xdrHeaderStrip=%u pktlen=%u]",
+                     encodingSize,
+                     packedSize,
+                     overrideEncodingSize,
+                     xdrHdrStrip,
+                     receiver->sampleCollector.pktlen);
         receiverError(receiver, errm);
         return -1;
     }
       
     /* update the pktlen */
-    receiver->sampleCollector.pktlen = (u_char *)receiver->sampleCollector.datap - (u_char *)receiver->sampleCollector.data;
+    receiver->sampleCollector.pktlen = (apr_byte_t *)receiver->sampleCollector.datap - (apr_byte_t *)receiver->sampleCollector.data;
     return packedSize;
 }
 
@@ -1302,12 +1238,12 @@ int sfl_receiver_writeEncodedFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_T
 static int computeCountersSampleSize(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_TYPE *cs)
 {
     SFLCounters_sample_element *elem;
-    uint32_t elemSiz;
+    apr_uint32_t elemSiz;
 
 #ifdef SFL_USE_32BIT_INDEX
     uint siz = 24; /* tag, length, sequence_number, ds_class, ds_index, number of elements */
 #else
-    uint32_t siz = 20; /* tag, length, sequence_number, source_id, number of elements */
+    apr_uint32_t siz = 20; /* tag, length, sequence_number, source_id, number of elements */
 #endif
 
     cs->num_elements = 0; /* we're going to count them again even if this was set by the client */
@@ -1323,8 +1259,8 @@ static int computeCountersSampleSize(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
         case SFLCOUNTERS_HTTP: elemSiz = XDRSIZ_SFLHTTP_COUNTERS /*sizeof(elem->counterBlock.http)*/;  break;
         default:
             {
-                char errm[128];
-                sprintf(errm, "computeCounterSampleSize(): unexpected counters tag (%u)", elem->tag);
+                char errm[MAX_ERRMSG_LEN];
+                apr_snprintf(errm, MAX_ERRMSG_LEN, "computeCounterSampleSize(): unexpected counters tag (%u)", elem->tag);
                 receiverError(receiver, errm);
                 return -1;
             }
@@ -1346,7 +1282,7 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
 {
     int packedSize;
     SFLCounters_sample_element *elem;
-    uint32_t encodingSize;
+    apr_uint32_t encodingSize;
 
     if(cs == NULL) return -1;
     /* if the sample pkt is full enough so that this sample might put */
@@ -1409,8 +1345,8 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
             break;
         default:
             {
-                char errm[128];
-                sprintf(errm, "unexpected counters tag (%u)", elem->tag);
+                char errm[MAX_ERRMSG_LEN];
+                apr_snprintf(errm, MAX_ERRMSG_LEN, "unexpected counters tag (%u)", elem->tag);
                 receiverError(receiver, errm);
                 return -1;
             }
@@ -1418,20 +1354,20 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
         }
     }
     /* sanity check */
-    encodingSize = (u_char *)receiver->sampleCollector.datap
-        - (u_char *)receiver->sampleCollector.data
+    encodingSize = (apr_byte_t *)receiver->sampleCollector.datap
+        - (apr_byte_t *)receiver->sampleCollector.data
         - receiver->sampleCollector.pktlen;
-    if(encodingSize != (uint32_t)packedSize) {
-        char errm[128];
-        sprintf(errm, "sfl_receiver_writeCountersSample: encoding_size(%u) != expected_size(%u)",
-                encodingSize,
-                packedSize);
+    if(encodingSize != (apr_uint32_t)packedSize) {
+        char errm[MAX_ERRMSG_LEN];
+        apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_receiver_writeCountersSample: encoding_size(%u) != expected_size(%u)",
+                     encodingSize,
+                     packedSize);
         receiverError(receiver, errm);
         return -1;
     }
 
     /* update the pktlen */
-    receiver->sampleCollector.pktlen = (u_char *)receiver->sampleCollector.datap - (u_char *)receiver->sampleCollector.data;
+    receiver->sampleCollector.pktlen = (apr_byte_t *)receiver->sampleCollector.datap - (apr_byte_t *)receiver->sampleCollector.data;
     return packedSize;
 }
 
@@ -1440,7 +1376,7 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
   -----------------_________________________________------------------
 */
 
-uint32_t sfl_receiver_samplePacketsSent(SFLReceiver *receiver)
+apr_uint32_t sfl_receiver_samplePacketsSent(SFLReceiver *receiver)
 {
     return receiver->sampleCollector.packetSeqNo;
 }
@@ -1461,42 +1397,15 @@ static void sendSample(SFLReceiver *receiver)
     putAddress(receiver, &agent->myIP);
     putNet32(receiver, agent->subId);
     putNet32(receiver, ++receiver->sampleCollector.packetSeqNo);
-    putNet32(receiver,  (uint32_t)((agent->now - agent->bootTime) * 1000));
+    putNet32(receiver,  (apr_uint32_t)((agent->now - agent->bootTime) * 1000));
     putNet32(receiver, receiver->sampleCollector.numSamples);
   
     /* send */
     if(agent->sendFn) (*agent->sendFn)(agent->magic,
                                        agent,
                                        receiver,
-                                       (u_char *)receiver->sampleCollector.data, 
+                                       (apr_byte_t *)receiver->sampleCollector.data, 
                                        receiver->sampleCollector.pktlen);
-    else {
-#ifdef SFLOW_DO_SOCKET
-        /* send it myself */
-        if (receiver->sFlowRcvrAddress.type == SFLADDRESSTYPE_IP_V6) {
-            uint32_t soclen = sizeof(struct sockaddr_in6);
-            int result = sendto(agent->receiverSocket6,
-                                receiver->sampleCollector.data,
-                                receiver->sampleCollector.pktlen,
-                                0,
-                                (struct sockaddr *)&receiver->receiver6,
-                                soclen);
-            if(result == -1 && errno != EINTR) sfl_agent_sysError(agent, "receiver", "IPv6 socket sendto error");
-            if(result == 0) sfl_agent_error(agent, "receiver", "IPv6 socket sendto returned 0");
-        }
-        else {
-            uint32_t soclen = sizeof(struct sockaddr_in);
-            int result = sendto(agent->receiverSocket4,
-                                receiver->sampleCollector.data,
-                                receiver->sampleCollector.pktlen,
-                                0,
-                                (struct sockaddr *)&receiver->receiver4,
-                                soclen);
-            if(result == -1 && errno != EINTR) sfl_agent_sysError(agent, "receiver", "socket sendto error");
-            if(result == 0) sfl_agent_error(agent, "receiver", "socket sendto returned 0");
-        }
-#endif
-    }
 
     /* reset for the next time */
     resetSampleCollector(receiver);
@@ -1513,7 +1422,7 @@ static void resetSampleCollector(SFLReceiver *receiver)
     receiver->sampleCollector.numSamples = 0;
 
     /* clear the buffer completely (ensures that pad bytes will always be zeros - thank you CW) */
-    memset((u_char *)receiver->sampleCollector.data, 0, (SFL_SAMPLECOLLECTOR_DATA_QUADS * 4));
+    memset((apr_byte_t *)receiver->sampleCollector.data, 0, (SFL_SAMPLECOLLECTOR_DATA_QUADS * 4));
 
     /* point the datap to just after the header */
     receiver->sampleCollector.datap = (receiver->agent->myIP.type == SFLADDRESSTYPE_IP_V6) ?
@@ -1521,7 +1430,7 @@ static void resetSampleCollector(SFLReceiver *receiver)
         (receiver->sampleCollector.data + 7);
 
     /* start pktlen with the right value */
-    receiver->sampleCollector.pktlen = (u_char *)receiver->sampleCollector.datap - (u_char *)receiver->sampleCollector.data;
+    receiver->sampleCollector.pktlen = (apr_byte_t *)receiver->sampleCollector.datap - (apr_byte_t *)receiver->sampleCollector.data;
 }
 
 /*_________________---------------------------__________________
@@ -1542,6 +1451,6 @@ static void receiverError(SFLReceiver *receiver, char *msg)
 selective exposure of some internal hooks,  just for this project
 */
 
-void sfl_receiver_put32(SFLReceiver *receiver, uint32_t val) { put32(receiver, val); }
+void sfl_receiver_put32(SFLReceiver *receiver, apr_uint32_t val) { put32(receiver, val); }
 void sfl_receiver_putOpaque(SFLReceiver *receiver, char *val, int len) { putOpaque(receiver, val, len); }
 void sfl_receiver_resetSampleCollector(SFLReceiver *receiver) { resetSampleCollector(receiver); }
