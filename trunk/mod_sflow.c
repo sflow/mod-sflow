@@ -380,8 +380,8 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
                 socElem.flowType.socket4.protocol = 6; /* TCP */
                 memcpy(&socElem.flowType.socket4.local_ip.addr, localsoc->ipaddr_ptr, 4);
                 memcpy(&socElem.flowType.socket4.remote_ip.addr, peersoc->ipaddr_ptr, 4);
-                socElem.flowType.socket4.local_port = ntohs(localsoc->port);
-                socElem.flowType.socket4.remote_port = ntohs(peersoc->port);
+                socElem.flowType.socket4.local_port = localsoc->port;
+                socElem.flowType.socket4.remote_port = peersoc->port;
             }
             else if(peersoc->ipaddr_len == 16 &&
                     peersoc->family == APR_INET6) {
@@ -394,16 +394,16 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
                     socElem.flowType.socket4.protocol = 6; /* TCP */
                     socElem.flowType.socket4.local_ip.addr = local_ip4addr.addr;
                     socElem.flowType.socket4.remote_ip.addr = remote_ip4addr.addr;
-                    socElem.flowType.socket4.local_port = ntohs(localsoc->port);
-                    socElem.flowType.socket4.remote_port = ntohs(peersoc->port);
+                    socElem.flowType.socket4.local_port = localsoc->port;
+                    socElem.flowType.socket4.remote_port = peersoc->port;
                 }
                 else {
                     socElem.tag = SFLFLOW_EX_SOCKET6;
                     socElem.flowType.socket6.protocol = 6; /* TCP */
                     memcpy(socElem.flowType.socket6.local_ip.addr, localsoc->ipaddr_ptr, 16);
                     memcpy(socElem.flowType.socket6.remote_ip.addr, peersoc->ipaddr_ptr, 16);
-                    socElem.flowType.socket6.local_port = ntohs(localsoc->port);
-                    socElem.flowType.socket6.remote_port = ntohs(peersoc->port);
+                    socElem.flowType.socket6.local_port = localsoc->port;
+                    socElem.flowType.socket6.remote_port = peersoc->port;
                 }
             }
             
