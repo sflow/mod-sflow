@@ -52,6 +52,17 @@
 **  was used in each child process.  This allows multiple worker-threads to
 **  share the same "child" sFlow agent.
 **
+**  Atomic Operations
+**  ================+
+**  Version 0.9.11 introduced the use of atomic operations so that the
+**  mutex in each child process is only aquired when a sample is to be taken,
+**  which should be comparatively rare (depending on the sampling rate used).
+**  There are now two apr_tomic_inc32() and one apr_atomic_dec32() calls in
+**  the critical path.  Atomic operations can be expensive,  but the assumption
+**  here is that they are a lot less expensive than having a large number of
+**  threads contend for just one mutex on every transaction.
+**
+**
 */ 
 
 /* Apache Runtime Library */
