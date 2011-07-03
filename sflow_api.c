@@ -518,10 +518,12 @@ apr_uint32_t sfl_sampler_get_sFlowFsPacketSamplingRate(SFLSampler *sampler) {
     return sampler->sFlowFsPacketSamplingRate;
 }
 
-void sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, apr_uint32_t sFlowFsPacketSamplingRate) {
+apr_uint32_t sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, apr_uint32_t sFlowFsPacketSamplingRate) {
     sampler->sFlowFsPacketSamplingRate = sFlowFsPacketSamplingRate;
-    /* initialize the skip count too */
-    sampler->skip = sFlowFsPacketSamplingRate ? sfl_random(sFlowFsPacketSamplingRate) : 0;
+    /* initialize the skip count too - and return the skip that we set */
+    apr_uint32_t next_skip = sFlowFsPacketSamplingRate ? sfl_random(sFlowFsPacketSamplingRate) : 0;
+    sampler->skip = next_skip; /* just set it - may result in sampling miscount but this shouldn't happen often */
+    return next_skip;
 }
 
 apr_uint32_t sfl_sampler_get_sFlowFsMaximumHeaderSize(SFLSampler *sampler) {
@@ -645,6 +647,10 @@ void sfl_random_init(apr_uint32_t seed) {
     SFLRandom = seed;
 } 
 
+apr_uint32_t sfl_sampler_next_skip(SFLSampler *sampler) {
+    return sfl_random((2 * sampler->sFlowFsPacketSamplingRate) - 1);
+}
+
 /*_________________---------------------------__________________
   _________________  sfl_sampler_takeSample   __________________
   -----------------___________________________------------------
@@ -657,7 +663,7 @@ int sfl_sampler_takeSample(SFLSampler *sampler)
 
     if(unlikely(--sampler->skip == 0)) {
         /* reached zero. Set the next skip and return true. */
-        sampler->skip = sfl_random((2 * sampler->sFlowFsPacketSamplingRate) - 1);
+        sampler->skip = sfl_sampler_next_skip(sampler);
         return 1;
     }
     return 0;

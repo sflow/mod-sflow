@@ -250,7 +250,7 @@ void        sfl_receiver_set_sFlowRcvrPort(SFLReceiver *receiver, apr_uint32_t s
 apr_uint32_t sfl_sampler_get_sFlowFsReceiver(SFLSampler *sampler);
 void      sfl_sampler_set_sFlowFsReceiver(SFLSampler *sampler, apr_uint32_t sFlowFsReceiver);
 apr_uint32_t sfl_sampler_get_sFlowFsPacketSamplingRate(SFLSampler *sampler);
-void      sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, apr_uint32_t sFlowFsPacketSamplingRate);
+apr_uint32_t sfl_sampler_set_sFlowFsPacketSamplingRate(SFLSampler *sampler, apr_uint32_t sFlowFsPacketSamplingRate);
 apr_uint32_t sfl_sampler_get_sFlowFsMaximumHeaderSize(SFLSampler *sampler);
 void      sfl_sampler_set_sFlowFsMaximumHeaderSize(SFLSampler *sampler, apr_uint32_t sFlowFsMaximumHeaderSize);
 /* poller */
@@ -269,6 +269,7 @@ void sfl_poller_resetCountersSeqNo(SFLPoller *poller);
   
 /* software sampling: call this with every packet - returns non-zero if the packet
    should be sampled (in which case you then call sfl_sampler_writeFlowSample()) */
+apr_uint32_t sfl_sampler_next_skip(SFLSampler *sampler);
 int sfl_sampler_takeSample(SFLSampler *sampler);
 
 /* call this to set a maximum samples-per-second threshold. If the sampler reaches this

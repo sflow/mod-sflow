@@ -221,7 +221,9 @@ typedef struct _SFLHTTP_counters {
   apr_uint32_t status_other_count;
 } SFLHTTP_counters;
 
-#define XDRSIZ_SFLHTTP_COUNTERS (15*4)
+#define SFLHTTP_NUM_COUNTERS 15
+
+#define XDRSIZ_SFLHTTP_COUNTERS (SFLHTTP_NUM_COUNTERS * 4)
 
 /* Counters data */
 

@@ -57,6 +57,7 @@
 /* Apache Runtime Library */
 #include "apr.h"
 #include "apr_time.h"
+#include "apr_atomic.h"
 
 /* Apache HTTPD includes */
 #include "httpd.h"
@@ -1145,7 +1146,7 @@ static void sflow_set_random_skip(SFWBChild *child)
         /* got a valid setting */
         if(n != sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler)) {
             /* it has changed */
-            sfl_sampler_set_sFlowFsPacketSamplingRate(child->sampler, n);
+            child->sampler->samplePool = sfl_sampler_set_sFlowFsPacketSamplingRate(child->sampler, n);
         }
     }
 }
@@ -1233,6 +1234,22 @@ static void send_msg_to_master(request_rec *r, SFWB *sm, void *msg, apr_size_t m
     }
 }
 
+/*_________________----------------------------------_______________
+  _________________      sflow_add_random_skip       _______________
+  -----------------__________________________________---------------
+  return the result of atomic-adding the next random skip.  Also
+  accumulate the lastSkip so that we know what it was when we get to take
+  the next sample.
+*/
+
+static apr_int32_t sflow_add_random_skip(SFLSampler *sampler)
+{
+    apr_uint32_t next_skip = sfl_sampler_next_skip(sampler);
+    sampler->samplePool += next_skip;
+    apr_uint32_t test_skip = apr_atomic_add32(&sampler->skip, next_skip);
+    return (apr_int32_t)(test_skip + next_skip);
+}
+
 /*_________________-----------------------------__________________
   _________________ sflow_multi_log_transaction __________________
   -----------------_____________________________------------------
@@ -1250,54 +1267,75 @@ static int sflow_multi_log_transaction(request_rec *r)
 
     apr_time_t now_uS = apr_time_now();
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow_multi_log_transaction (sampler->skip=%u)", child->sampler->skip);
-    apr_uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
 
-    /* The simplest thing here is just to mutex-lock this whole step.
-       Most times through here we do very little anyway.  The alternative
-       would be to use atomic operations for the increments/decrements/tests that
-       we do every time, and only grab the mutex when we really have to,
-       but it's not clear if that would help or not.  It could easily end up
-       costing more. */
-    bool_t ctrl = false;
-    bool_t lockingOK = false;
-    SEMLOCK_DO(child->mutex, ctrl, lockingOK) {
-        SFLHTTP_counters *ctrs = &child->http_counters.counterBlock.http;
-        switch(method) {
-        case SFHTTP_HEAD: ctrs->method_head_count++; break;
-        case SFHTTP_GET: ctrs->method_get_count++; break;
-        case SFHTTP_PUT: ctrs->method_put_count++; break;
-        case SFHTTP_POST: ctrs->method_post_count++; break;
-        case SFHTTP_DELETE: ctrs->method_delete_count++; break;
-        case SFHTTP_CONNECT: ctrs->method_connect_count++; break;
-        case SFHTTP_OPTIONS: ctrs->method_option_count++; break;
-        case SFHTTP_TRACE: ctrs->method_trace_count++; break;
-        default: ctrs->method_other_count++; break;
-        }
-        if(r->status < 100) ctrs->status_other_count++;
-        else if(r->status < 200) ctrs->status_1XX_count++;
-        else if(r->status < 300) ctrs->status_2XX_count++;
-        else if(r->status < 400) ctrs->status_3XX_count++;
-        else if(r->status < 500) ctrs->status_4XX_count++;
-        else if(r->status < 600) ctrs->status_5XX_count++;    
-        else ctrs->status_other_count++;
-   
-        if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler) == 0)) {
-            /* don't have a sampling-rate setting yet. Check to see... */
+    /* The simplest thing here would be just to mutex-lock this whole step.
+       Most times through here we do very little anyway.  However the alternative
+       is to use atomic operations for the increments/decrements/tests that
+       we do every time, and only grab the mutex when we take a sample. Since
+       this module is intended to run on busy servers with large
+       numbers of CPU-cores and threads the preference is for atomic operations.
+       It's better to burn a few more cycles each time than to risk having the
+       threads stall completely as they squabble over a mutex.  It looks like
+       we only need three atomic ops anyway:
+       1. increment method_xxx counter
+       2. increment status_xxx counter
+       3. decrement sampler skip
+    */
+
+    /* 1. increment method_xxx counter */
+    apr_uint32_t method = r->header_only ? SFHTTP_HEAD : methodNumberLookup(r->method_number);
+    SFLHTTP_counters *ctrs = &child->http_counters.counterBlock.http;
+    apr_uint32_t *ctrptr;
+    switch(method) {
+    case SFHTTP_HEAD: ctrptr = &ctrs->method_head_count; break;
+    case SFHTTP_GET: ctrptr = &ctrs->method_get_count; break;
+    case SFHTTP_PUT: ctrptr = &ctrs->method_put_count; break;
+    case SFHTTP_POST: ctrptr = &ctrs->method_post_count; break;
+    case SFHTTP_DELETE: ctrptr = &ctrs->method_delete_count; break;
+    case SFHTTP_CONNECT: ctrptr = &ctrs->method_connect_count; break;
+    case SFHTTP_OPTIONS: ctrptr = &ctrs->method_option_count; break;
+    case SFHTTP_TRACE: ctrptr = &ctrs->method_trace_count; break;
+    default: ctrptr = &ctrs->method_other_count; break;
+    }
+    apr_atomic_inc32(ctrptr);
+    
+    /* 2. increment status_xxx counter */
+    if(r->status < 100) ctrptr = &ctrs->status_other_count;
+    else if(r->status < 200) ctrptr = &ctrs->status_1XX_count;
+    else if(r->status < 300) ctrptr = &ctrs->status_2XX_count;
+    else if(r->status < 400) ctrptr = &ctrs->status_3XX_count;
+    else if(r->status < 500) ctrptr = &ctrs->status_4XX_count;
+    else if(r->status < 600) ctrptr = &ctrs->status_5XX_count;    
+    else ctrptr = &ctrs->status_other_count;
+    apr_atomic_inc32(ctrptr);
+    
+    /* 3. decrement sampler skip (if we are sampling) */
+    if(unlikely(sfl_sampler_get_sFlowFsPacketSamplingRate(child->sampler) == 0)) {
+        /* don't have a sampling-rate setting yet. Check to see... */
             sflow_set_random_skip(child);
-        }
-        else if(unlikely(sfl_sampler_takeSample(child->sampler))) {
+    }
+    else if(unlikely(apr_atomic_dec32(&child->sampler->skip) == 0)) {
+        bool_t ctrl = false;
+        bool_t lockingOK = false;
+        SEMLOCK_DO(child->mutex, ctrl, lockingOK) {
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sflow take sample: r->method_number=%u", r->method_number);
             /* point to the start of the datagram */
             apr_uint32_t *msg = child->receiver->sampleCollector.datap;
+
             /* msglen, msgType, sample pool and drops */
             sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
             sfl_receiver_put32(child->receiver, SFLFLOW_SAMPLE);
             sfl_receiver_put32(child->receiver, SFLFLOW_HTTP);
             sfl_receiver_put32(child->receiver, child->sampler->samplePool);
             sfl_receiver_put32(child->receiver, child->sampler->dropEvents);
-            /* and reset so they can be accumulated by the other process */
-            child->sampler->samplePool = 0;
+            
+            /* reset drops but don't bother using atomic op since we don't mind if this counter
+               is imprecise. Under normal conditions it should never be incremented at all. */
             child->sampler->dropEvents = 0;
+            /* the samplePool is only ever accessed inside this mutex-protected block so we can
+               be straightforward about it too */
+            child->sampler->samplePool = 0;
+            
             /* accumulate the pktlen here too, to satisfy a sanity-check in the sflow library (receiver) */
             child->receiver->sampleCollector.pktlen += 20;
 
@@ -1328,21 +1366,67 @@ static int sflow_multi_log_transaction(request_rec *r)
             send_msg_to_master(r, sm, msg, msgBytes, "http sample");
             /* reset the encoder for next time */
             sfl_receiver_resetSampleCollector(child->receiver);
+
+            /* the skip counter could be something like -1 or -2 now if other threads were decrementing
+               it while we were taking this sample. So rather than just set the new skip count and ignore those
+               other decrements, we do an atomic add.
+               In the extreme case where the new random skip is small then we might not get the skip back above 0
+               with this add,  and so the new skip would effectively be ~ 2^32.  Just to make sure that doesn't
+               happen we loop until the skip is above 0 (and count any extra adds as drop-events). */
+            /* one advantage of this approach is that we only have to generate a new random number when we
+               take a sample,  and because we have the mutex locked we don't need to make the random number
+               seed a per-thread variable. */
+            while(sflow_add_random_skip(child->sampler) < 0) {
+                child->sampler->dropEvents++;
+            }
+
         }
 
-    
-        if((now_uS - child->lastTickTime) > SFWB_CHILD_TICK_US) {
+        if(!lockingOK) {
+            /* something went wrong with acquiring or releasing the mutex lock.
+               That's a show-stopper. Bow out gracefully. */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "sFlow mutex locking error - parking module");
+            child->sflow_disabled = true;
+        }
+    }
+        
+            
+    if((now_uS - child->lastTickTime) > SFWB_CHILD_TICK_US) {
+        bool_t ctrl = false;
+        bool_t lockingOK = false;
+        SEMLOCK_DO(child->mutex, ctrl, lockingOK) {
             child->lastTickTime = now_uS;
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "child tick - sending counters");
+
+            /* read and reset each counter using an atomic exchange
+               because other threads may still be incrementing these under our feet */
+            SFLHTTP_counters ctrs_snapshot;
+            ctrs_snapshot.method_option_count = apr_atomic_xchg32(&ctrs->method_option_count, 0);
+            ctrs_snapshot.method_get_count = apr_atomic_xchg32(&ctrs->method_get_count, 0);
+            ctrs_snapshot.method_head_count = apr_atomic_xchg32(&ctrs->method_head_count, 0);
+            ctrs_snapshot.method_post_count = apr_atomic_xchg32(&ctrs->method_post_count, 0);
+            ctrs_snapshot.method_put_count = apr_atomic_xchg32(&ctrs->method_put_count, 0);
+            ctrs_snapshot.method_delete_count = apr_atomic_xchg32(&ctrs->method_delete_count, 0);
+            ctrs_snapshot.method_trace_count = apr_atomic_xchg32(&ctrs->method_trace_count, 0);
+            ctrs_snapshot.method_connect_count = apr_atomic_xchg32(&ctrs->method_connect_count, 0);
+            ctrs_snapshot.method_other_count = apr_atomic_xchg32(&ctrs->method_other_count, 0);
+            ctrs_snapshot.status_1XX_count = apr_atomic_xchg32(&ctrs->status_1XX_count, 0);
+            ctrs_snapshot.status_2XX_count = apr_atomic_xchg32(&ctrs->status_2XX_count, 0);
+            ctrs_snapshot.status_3XX_count = apr_atomic_xchg32(&ctrs->status_3XX_count, 0);
+            ctrs_snapshot.status_4XX_count = apr_atomic_xchg32(&ctrs->status_4XX_count, 0);
+            ctrs_snapshot.status_5XX_count = apr_atomic_xchg32(&ctrs->status_5XX_count, 0);
+            ctrs_snapshot.status_other_count = apr_atomic_xchg32(&ctrs->status_other_count, 0);
+
             /* point to the start of the datagram */
             apr_uint32_t *msg = child->receiver->sampleCollector.datap;
             /* msglen, msgType, msgId */
             sfl_receiver_put32(child->receiver, 0); /* we'll come back and fill this in later */
             sfl_receiver_put32(child->receiver, SFLCOUNTERS_SAMPLE);
             sfl_receiver_put32(child->receiver, SFLCOUNTERS_HTTP);
-            sfl_receiver_putOpaque(child->receiver, (char *)ctrs, sizeof(*ctrs));
-            /* now reset my private counter block so that we only send the delta each time */
-            memset(ctrs, 0, sizeof(*ctrs));
+            /* this assumes that sizeof(SFLHTTP_counters) == XDRSIZ_SFLHTTP_COUNTERS
+               should probably check that with an assertion, perhaps at compile-time? Or
+               we could use a compiler directive to make sure that the struct is packed */
+            sfl_receiver_putOpaque(child->receiver, (char *)&ctrs_snapshot, sizeof(ctrs_snapshot));
             /* get the msg bytes */
             apr_size_t msgBytes = (child->receiver->sampleCollector.datap - msg) << 2;
             /* write this in as the first 32-bit word */
@@ -1351,16 +1435,18 @@ static int sflow_multi_log_transaction(request_rec *r)
             send_msg_to_master(r, sm, msg, msgBytes, "counter update");
             /* reset the encoder for next time */
             sfl_receiver_resetSampleCollector(child->receiver);
-            /* check in case the sampling-rate setting has changed. */
-            sflow_set_random_skip(child);
-        }
-    } /* SEMLOCK_DO */
 
-    if(!lockingOK) {
-        /* something went wrong with acquiring or releasing the mutex lock.
-           That's a show-stopper. Bow out gracefully. */
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "sFlow mutex locking error - parking module");
-        child->sflow_disabled = true;
+            /* This is a convenient time time to check in case the sampling-rate setting has changed. */
+            sflow_set_random_skip(child);
+
+        } /* SEMLOCK_DO */
+        
+        if(!lockingOK) {
+            /* something went wrong with acquiring or releasing the mutex lock.
+               That's a show-stopper. Bow out gracefully. */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "sFlow mutex locking error - parking module");
+            child->sflow_disabled = true;
+        }
     }
 
     return OK;
