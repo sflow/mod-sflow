@@ -781,9 +781,9 @@ static void sflow_init(SFWB *sm, server_rec *s)
         
         /* add a <logicalEntity> datasource to represent this application instance */
         SFLDataSource_instance dsi;
-        /* ds_class = <logicalEntity>, ds_index = 65537, ds_instance = 0 */
+        /* ds_class = <logicalEntity>, ds_index = 65540, ds_instance = 0 */
         /* $$$ should learn the ds_index from the config file */
-        SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, 65537, 0);
+        SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, 65540, 0);
           
         /* add a poller for the counters */
         sm->poller = sfl_agent_addPoller(sm->agent, &dsi, sm, sfwb_cb_counters);
