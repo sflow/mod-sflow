@@ -976,9 +976,10 @@ static apr_uint32_t httpOpEncodingLength(SFLSampled_http *op) {
   elemSiz += stringEncodingLength(&op->host);
   elemSiz += stringEncodingLength(&op->referrer);
   elemSiz += stringEncodingLength(&op->useragent);
+  elemSiz += stringEncodingLength(&op->xff);
   elemSiz += stringEncodingLength(&op->authuser);
   elemSiz += stringEncodingLength(&op->mimetype);
-  elemSiz += 24; /* method, protocol, bytes, uS, status */
+  elemSiz += 32; /* method, protocol, req_bytes, resp_bytes, uS, status */
   return elemSiz;
 }
 
@@ -1118,9 +1119,11 @@ int sfl_receiver_writeFlowSample(SFLReceiver *receiver, SFL_FLOW_SAMPLE_TYPE *fs
             putString(receiver, &elem->flowType.http.host);
             putString(receiver, &elem->flowType.http.referrer);
             putString(receiver, &elem->flowType.http.useragent);
+            putString(receiver, &elem->flowType.http.xff);
             putString(receiver, &elem->flowType.http.authuser);
             putString(receiver, &elem->flowType.http.mimetype);
-            putNet64(receiver, elem->flowType.http.bytes);
+            putNet64(receiver, elem->flowType.http.req_bytes);
+            putNet64(receiver, elem->flowType.http.resp_bytes);
             putNet32(receiver, elem->flowType.http.uS);
             putNet32(receiver, elem->flowType.http.status);
             break;
@@ -1262,6 +1265,7 @@ static int computeCountersSampleSize(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
            structures are expanded to be 64-bit aligned */
 
         switch(elem->tag) {
+        case SFLCOUNTERS_HOST_PAR: elemSiz = 8 /*sizeof(elem->counterBlock.host_par)*/;  break;
         case SFLCOUNTERS_HTTP: elemSiz = XDRSIZ_SFLHTTP_COUNTERS /*sizeof(elem->counterBlock.http)*/;  break;
         default:
             {
@@ -1332,6 +1336,10 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
         putNet32(receiver, elem->length); /* length cached in computeCountersSampleSize() */
     
         switch(elem->tag) {
+        case SFLCOUNTERS_HOST_PAR:
+            putNet32(receiver, elem->counterBlock.host_par.dsClass);
+            putNet32(receiver, elem->counterBlock.host_par.dsIndex);
+            break;
         case SFLCOUNTERS_HTTP:
             putNet32(receiver, elem->counterBlock.http.method_option_count);
             putNet32(receiver, elem->counterBlock.http.method_get_count);
