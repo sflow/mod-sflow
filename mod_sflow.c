@@ -69,12 +69,15 @@
 #include "apr.h"
 #include "apr_time.h"
 #include "apr_atomic.h"
+#include "apr_network_io.h"
+#include "apr_optional.h"
 
 /* Apache HTTPD includes */
 #include "httpd.h"
 #include "http_config.h"
 #include "http_protocol.h"
 #include "http_log.h"
+#include "ap_listen.h"
 
 #define APR_WANT_BYTEFUNC   /* htonl */
 #define ARP_WANT_MEMFUNC    /* memcpy */
@@ -122,6 +125,14 @@ module AP_MODULE_DECLARE_DATA sflow_module;
 #define GET_CONFIG_DATA(s) ap_get_module_config((s)->module_config, &sflow_module)
 
 /*_________________---------------------------__________________
+  _________________   optional mod_logio fn   __________________
+  -----------------___________________________------------------
+*/
+
+APR_DECLARE_OPTIONAL_FN(apr_off_t,ap_logio_get_last_bytes,(conn_rec *));
+static APR_OPTIONAL_FN_TYPE(ap_logio_get_last_bytes) *pfn_ap_logio_get_last_bytes;
+
+/*_________________---------------------------__________________
   _________________   config parsing defs     __________________
   -----------------___________________________------------------
 */
@@ -166,6 +177,7 @@ typedef struct _SFWBConfig {
     bool_t got_sampling_n_http;
     bool_t got_polling_secs_http;
     SFLAddress agentIP;
+    apr_uint32_t parent_ds_index;
     apr_uint32_t num_collectors;
     SFWBCollector collectors[SFWB_MAX_COLLECTORS];
     apr_pool_t *pool;
@@ -276,6 +288,7 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
 {
     SFWB *sm = (SFWB *)poller->magic;
     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
+    SFLCounters_sample_element parElem = { 0 };
         
     if(sm->config == NULL) {
         /* config is disabled */
@@ -289,6 +302,15 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
 
     /* per-child counters have been accumulated into this shared-memory block, so we can just submit it */
     SFLADD_ELEMENT(cs, &shared->http_counters);
+
+    if(sm->config->parent_ds_index) {
+        /* we learned the parent_ds_index from the config file, so add a parent structure too. */
+        parElem.tag = SFLCOUNTERS_HOST_PAR;
+        parElem.counterBlock.host_par.dsClass = SFL_DSCLASS_PHYSICAL_ENTITY;
+        parElem.counterBlock.host_par.dsIndex = sm->config->parent_ds_index;
+        SFLADD_ELEMENT(cs, &parElem);
+    }
+
     sfl_poller_writeCountersSample(poller, cs);
 }
 
@@ -347,7 +369,7 @@ static int my_strnlen(const char *s, apr_size_t max) {
     return max;
 }
 
-static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, SFLHTTP_method method, apr_uint32_t proto_num, const char *uri, const char *host, const char *referrer, const char *useragent, const char *authuser, const char *mimetype, apr_uint64_t bytes, apr_uint32_t duration_uS, apr_uint32_t status)
+static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, SFLHTTP_method method, apr_uint32_t proto_num, const char *uri, const char *host, const char *referrer, const char *useragent, const char *xff, const char *authuser, const char *mimetype, apr_uint64_t req_bytes, apr_uint64_t resp_bytes, apr_uint32_t duration_uS, apr_uint32_t status)
 {
     
     SFL_FLOW_SAMPLE_TYPE fs = { 0 };
@@ -369,11 +391,14 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
     httpElem.flowType.http.referrer.len = my_strnlen(referrer, SFLHTTP_MAX_REFERRER_LEN);
     httpElem.flowType.http.useragent.str = useragent;
     httpElem.flowType.http.useragent.len = my_strnlen(useragent, SFLHTTP_MAX_USERAGENT_LEN);
+    httpElem.flowType.http.xff.str = xff;
+    httpElem.flowType.http.xff.len = my_strnlen(xff, SFLHTTP_MAX_XFF_LEN);
     httpElem.flowType.http.authuser.str = authuser;
     httpElem.flowType.http.authuser.len = my_strnlen(authuser, SFLHTTP_MAX_AUTHUSER_LEN);
     httpElem.flowType.http.mimetype.str = mimetype;
     httpElem.flowType.http.mimetype.len = my_strnlen(mimetype, SFLHTTP_MAX_MIMETYPE_LEN);
-    httpElem.flowType.http.bytes = bytes;
+    httpElem.flowType.http.req_bytes = req_bytes;
+    httpElem.flowType.http.resp_bytes = resp_bytes;
     httpElem.flowType.http.uS = duration_uS;
     httpElem.flowType.http.status = status;
     SFLADD_ELEMENT(&fs, &httpElem);
@@ -612,6 +637,10 @@ static SFWBConfig *sfwb_readConfig(SFWB *sm, server_rec *s)
                     sfwb_syntaxError(config, lineNo, "exceeded max collectors");
                 }
             }
+            else if(strcasecmp(tokv[0], "ds_index") == 0
+                    && sfwb_syntaxOK(config, lineNo, tokc, 2, 2, "ds_index=<int>")) {
+                config->parent_ds_index = strtol(tokv[1], NULL, 0);
+            }
             else if(strcasecmp(tokv[0], "header") == 0) { /* ignore */ }
             else if(strcasecmp(tokv[0], "agent") == 0) { /* ignore */ }
             else if(strncasecmp(tokv[0], "sampling.", 9) == 0) { /* ignore other sampling.<app> settings */ }
@@ -693,7 +722,9 @@ void sflow_tick(SFWB *sm, server_rec *s) {
     if(--sm->configCountDown <= 0) {
         apr_time_t modTime = configModified(sm, s);
         sm->configCountDown = SFWB_CONFIG_CHECK_S;
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "checking for config file change <%s>", sm->configFile);
+
+        /* too verbose, even for LogLevel==debug */
+        /* ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "checking for config file change <%s>", sm->configFile); */
 
         if(modTime == 0) {
             /* config file missing */
@@ -719,6 +750,41 @@ void sflow_tick(SFWB *sm, server_rec *s) {
     if(sm->agent && sm->config) {
         sfl_agent_tick(sm->agent, sm->currentTime);
     }
+}
+
+/*_________________---------------------------__________________
+  _________________ lowest active listen port __________________
+  -----------------___________________________------------------
+*/
+
+static apr_uint16_t lowestActiveListenPort(server_rec *s)
+{
+    ap_listen_rec *lr = ap_listeners;
+    apr_uint16_t port = 0, p;
+    apr_sockaddr_t *localsoc = NULL;
+
+    for( ; lr ; lr=lr->next) {
+        if(lr->active && lr->sd) {
+            if(apr_socket_addr_get(&localsoc, APR_LOCAL, lr->sd) == APR_SUCCESS) {
+                p = localsoc->port;
+                if(p &&
+                   (port == 0 || port > p)) {
+                    port = p;
+                }
+            }
+        }
+    }
+
+    if(port == 0) {
+        // fallback - maybe the server_rec has a port number for us
+        port = s->port;
+    }
+
+    if(port == 0) {
+        // ultimate fallback - the hard-coded default
+        port = DEFAULT_HTTP_PORT;
+    }
+    return port;
 }
 
 /*_________________---------------------------__________________
@@ -781,9 +847,9 @@ static void sflow_init(SFWB *sm, server_rec *s)
         
         /* add a <logicalEntity> datasource to represent this application instance */
         SFLDataSource_instance dsi;
-        /* ds_class = <logicalEntity>, ds_index = 65540, ds_instance = 0 */
-        /* $$$ should learn the ds_index from the config file */
-        SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, 65540, 0);
+        /* ds_class = <logicalEntity>, ds_index = <listen port>, ds_instance = 0 */
+
+        SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, lowestActiveListenPort(s), 0);
           
         /* add a poller for the counters */
         sm->poller = sfl_agent_addPoller(sm->agent, &dsi, sm, sfwb_cb_counters);
@@ -1027,6 +1093,16 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY, apr_pool_cleanup_null, s->process->pool);
         return OK;
     }
+    
+    /* get here on the second call... */
+
+    /* try to retrieve the optional fn pointer from mod_logio that allows us to report both bytes_in and bytes_out */
+    if(!pfn_ap_logio_get_last_bytes) {
+        pfn_ap_logio_get_last_bytes = APR_RETRIEVE_OPTIONAL_FN(ap_logio_get_last_bytes);
+        if(!pfn_ap_logio_get_last_bytes) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "unable to retrieve optional fn ap_logio_get_last_bytes() -- perhaps mod logio not loaded?");
+        }
+    }
 
     if(sm) {
         
@@ -1081,6 +1157,7 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u", getpid(),MYGETTID);
 #endif
+
     /* create my own private state, and hang it off the shared state */
     SFWBChild *child = (SFWBChild *)apr_pcalloc(p, sizeof(SFWBChild));
     sm->child = child;
@@ -1261,6 +1338,29 @@ static apr_int32_t sflow_add_random_skip(SFLSampler *sampler)
     return (apr_int32_t)(test_skip + next_skip);
 }
 
+
+/*_________________-----------------------------__________________
+  _________________     get_bytes_in            __________________
+  -----------------_____________________________------------------
+*/
+
+static apr_off_t get_bytes_in(request_rec *r)
+{
+    apr_uint64_t ans = 0;
+    if(pfn_ap_logio_get_last_bytes) {
+        /* mod_logio has supplied us with an option fn, but it only
+           exposes the total bytes this way (the in/out bytes calls
+           into mod_logio are shared only with the logger module).
+           Happily we already know bytes_sent so we can just subtract it
+           to get bytes_in.  I imagine that this will sometimes
+           be wrong,  but probably not by much. */
+        apr_uint64_t total_bytes = pfn_ap_logio_get_last_bytes(r->connection);
+        apr_uint64_t bytes_out = r->bytes_sent;
+        if(total_bytes >= bytes_out) ans = total_bytes - bytes_out;
+    }
+    return ans;
+}
+
 /*_________________-----------------------------__________________
   _________________ sflow_multi_log_transaction __________________
   -----------------_____________________________------------------
@@ -1353,18 +1453,21 @@ static int sflow_multi_log_transaction(request_rec *r)
             const char *referer = apr_table_get(r->headers_in, "Referer");
             const char *useragent = apr_table_get(r->headers_in, "User-Agent");
             const char *contentType = apr_table_get(r->headers_in, "Content-Type");
+            const char *xff = apr_table_get(r->headers_in, "X-Forwarded-For");
 
             /* encode the transaction sample next */
             sflow_sample_http(child->sampler,
                               r->connection,
                               method,
                               r->proto_num,
-                              r->uri, /* r->the_request ? */
-                              r->hostname, /* r->server->server_hostname ?*/
+                              r->unparsed_uri,
+                              r->hostname,
                               referer,
                               useragent,
+                              xff,
                               r->user,
                               contentType,
+                              get_bytes_in(r),
                               r->bytes_sent,
                               now_uS - r->request_time,
                               r->status);
