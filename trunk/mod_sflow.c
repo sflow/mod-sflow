@@ -1490,7 +1490,7 @@ static int sflow_multi_log_transaction(request_rec *r)
             /* one advantage of this approach is that we only have to generate a new random number when we
                take a sample,  and because we have the mutex locked we don't need to make the random number
                seed a per-thread variable. */
-            while(sflow_add_random_skip(child->sampler) < 0) {
+            while(sflow_add_random_skip(child->sampler) <= 0) {
                 child->sampler->dropEvents++;
             }
 
