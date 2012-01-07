@@ -919,7 +919,7 @@ static void putNet32(SFLReceiver *receiver, apr_uint32_t val)
     *receiver->sampleCollector.datap++ = htonl(val);
 }
 
-static void putNet64(SFLReceiver *receiver, uint64_t val64)
+static void putNet64(SFLReceiver *receiver, apr_uint64_t val64)
 {
     apr_uint32_t *firstQuadPtr = receiver->sampleCollector.datap;
     /* first copy the bytes in */
