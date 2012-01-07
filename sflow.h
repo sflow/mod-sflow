@@ -102,8 +102,8 @@ typedef struct _SFLSampled_http {
   SFLString xff;               /* X-Forwarded-For from request header */
   SFLString authuser;          /* RFC 1413 identity of user*/
   SFLString mimetype;          /* Mime-Type */
-  uint64_t req_bytes;          /* Content-Length of request */
-  uint64_t resp_bytes;         /* Content-Length of response */
+  apr_uint64_t req_bytes;      /* Content-Length of request */
+  apr_uint64_t resp_bytes;     /* Content-Length of response */
   apr_uint32_t uS;             /* duration of the operation (microseconds) */
   apr_uint32_t status;         /* HTTP status code */
 } SFLSampled_http;
