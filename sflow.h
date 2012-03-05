@@ -225,8 +225,8 @@ typedef struct _SFLHTTP_counters {
 } SFLHTTP_counters;
 
 typedef struct _SFLHost_par_counters {
-  uint32_t dsClass;       /* sFlowDataSource class */
-  uint32_t dsIndex;       /* sFlowDataSource index */
+  apr_uint32_t dsClass;       /* sFlowDataSource class */
+  apr_uint32_t dsIndex;       /* sFlowDataSource index */
 } SFLHost_par_counters;
 
 #define SFLHTTP_NUM_COUNTERS 15

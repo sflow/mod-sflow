@@ -795,6 +795,7 @@ static apr_uint16_t lowestActiveListenPort(server_rec *s)
 static void sflow_init(SFWB *sm, server_rec *s)
 {
     apr_status_t rc;
+    apr_uint16_t servicePort;
 
     if(sm->configFile == NULL) {
         sm->configFile = SFWB_DEFAULT_CONFIGFILE;
@@ -824,6 +825,8 @@ static void sflow_init(SFWB *sm, server_rec *s)
             if((rc = apr_socket_create(&sm->socket6, APR_INET6, SOCK_DGRAM, APR_PROTO_UDP, sm->masterPool)) != APR_SUCCESS)
                 ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "IPv6 send socket open failed");
         }
+
+        servicePort = lowestActiveListenPort(s);
         
         /* initialize the agent with it's address, bootime, callbacks etc. */
         sfl_agent_init(sm->agent,
@@ -849,7 +852,7 @@ static void sflow_init(SFWB *sm, server_rec *s)
         SFLDataSource_instance dsi;
         /* ds_class = <logicalEntity>, ds_index = <listen port>, ds_instance = 0 */
 
-        SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, lowestActiveListenPort(s), 0);
+        SFL_DS_SET(dsi, SFL_DSCLASS_LOGICAL_ENTITY, servicePort, 0);
           
         /* add a poller for the counters */
         sm->poller = sfl_agent_addPoller(sm->agent, &dsi, sm, sfwb_cb_counters);
