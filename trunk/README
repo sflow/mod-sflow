@@ -10,11 +10,30 @@ http://www.inmon.com/technology/sflowlicense.txt
          continuous,
           real-time monitoring of very large and very busy web farms.
 
-Installation
-============
+Installation (from rpm)
+=======================
 
-  To try this module, first compile it into a
-  DSO file and install it into Apache's modules directory 
+  Make sure the httpd-devel package is installed (to get the "apxs"
+  command), then try this:
+
+    $ rpmbuild -ba mod_sflow.spec
+
+  (You might have to copy the mod-sflow-<vesrion>.tar.gz file into
+   whatever SOURCES directory rpmbuild looks in, and try again)
+
+  rpmbuild will write the rpm into its RPMS/<arch>/ directory. To
+  install mod-sflow on this server (and any other server with
+  the same architecture, OS and apache version):
+
+    $ rpm -Uvh mod-sflow-<version>.<os>.<arch>.rpm
+
+  confirm that the mod_sflow.so file and related httpd.conf config
+  went to the right place, then restart apache.
+
+Installation (direct from sources)
+==================================
+
+  Compile and install the module into Apache's modules directory 
   and add it to the apache httpd.conf config file by running:
 
     $ apxs -c -i -a mod_sflow.c sflow_api.c
@@ -155,3 +174,7 @@ Example output from sflowtool:
 	http_status_other_count 0
 	endSample   ----------------------
 	endDatagram   =================================
+
+AUTHORS:
+Neil McKee <neil.mckee@inmon.com>
+Ian Meyer <ianmeyer@gmail.com>
