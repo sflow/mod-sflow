@@ -1455,7 +1455,7 @@ static int sflow_multi_log_transaction(request_rec *r)
 
             const char *referer = apr_table_get(r->headers_in, "Referer");
             const char *useragent = apr_table_get(r->headers_in, "User-Agent");
-            const char *contentType = apr_table_get(r->headers_in, "Content-Type");
+            const char *contentType = apr_table_get(r->headers_out, "Content-Type");
             const char *xff = apr_table_get(r->headers_in, "X-Forwarded-For");
 
             /* encode the transaction sample next */
