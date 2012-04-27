@@ -408,7 +408,25 @@ static void sflow_sample_http(SFLSampler *sampler, struct conn_rec *connection, 
     if(connection) {
         /* add a socket structure */
         apr_sockaddr_t *localsoc = connection->local_addr;
+#if AP_MODULE_MAGIC_AT_LEAST(20111130,0)
+        apr_sockaddr_t *peersoc = connection->client_addr;
+#else
         apr_sockaddr_t *peersoc = connection->remote_addr;
+#endif
+
+        /* note: from <http://httpd.apache.org/docs/2.4/developer/new_api_2_4.html>
+         *  conn_rec->remote_ip and conn_rec->remote_addr
+         * These fields have been renamed in order to distinguish between the client IP address of
+         * the connection and the useragent IP address of the request (potentially overridden by a
+         * load balancer or proxy). References to either of these fields must be updated with one of
+         * the following options, as appropriate for the module:
+         *    When you require the IP address of the user agent, which might be connected directly to
+         *     the server, or might optionally be separated from the server by a transparent load
+         *     balancer or proxy, use request_rec->useragent_ip and request_rec->useragent_addr.
+         *    When you require the IP address of the client that is connected directly to the server,
+         *     which might be the useragent or might be the load balancer or proxy itself, use
+         *     conn_rec->client_ip and conn_rec->client_addr.
+         */
 
         if(localsoc && peersoc) {
             if(peersoc->ipaddr_len == 4 &&
