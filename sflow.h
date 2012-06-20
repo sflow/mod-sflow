@@ -233,17 +233,32 @@ typedef struct _SFLHost_par_counters {
 
 #define XDRSIZ_SFLHTTP_COUNTERS (SFLHTTP_NUM_COUNTERS * 4)
 
+/* Enterprise application workers */
+/* opaque = counter_data; enterprise = 0; format = 2206 */
+
+typedef struct {
+  uint32_t workers_active;
+  uint32_t workers_idle;
+  uint32_t workers_max;
+  uint32_t req_delayed;
+  uint32_t req_dropped;
+} SFLAPPWorkers;
+
+#define XDRSIZ_APP_WORKERS (5 * 4)
+
 /* Counters data */
 
 enum SFLCounters_type_tag {
   /* enterprise = 0, format = ... */
   SFLCOUNTERS_HOST_PAR      = 2002, /* host parent */
   SFLCOUNTERS_HTTP          = 2201, /* http counters */
+  SFLCOUNTERS_APP_WORKERS   = 2206,
 };
 
 typedef union _SFLCounters_type {
   SFLHost_par_counters host_par;
   SFLHTTP_counters http;
+  SFLAPPWorkers app_workers;
 } SFLCounters_type;
 
 typedef struct _SFLCounters_sample_element {

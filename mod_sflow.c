@@ -79,6 +79,10 @@
 #include "http_log.h"
 #include "ap_listen.h"
 
+/* for workers */
+#include "ap_mpm.h"
+#include "scoreboard.h"
+
 #define APR_WANT_BYTEFUNC   /* htonl */
 #define ARP_WANT_MEMFUNC    /* memcpy */
 #include "apr_want.h"
@@ -200,6 +204,11 @@ typedef struct _SFWB {
 #ifdef SFWB_DEBUG
     int mpm_threaded;
 #endif
+    int mpm_thread_limit;
+    int mpm_server_limit;
+    int mpm_threads_per_child;
+    int mpm_max_servers;
+    int mpm_is_async;
 
     /* master process */
     apr_proc_t *sFlowProc;
@@ -289,6 +298,10 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
     SFWB *sm = (SFWB *)poller->magic;
     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
     SFLCounters_sample_element parElem = { 0 };
+    SFLCounters_sample_element app_workers = { 0 };
+    apr_int32_t i, j, res;
+    worker_score *ws_record;
+    process_score *ps_record;
         
     if(sm->config == NULL) {
         /* config is disabled */
@@ -310,6 +323,20 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
         parElem.counterBlock.host_par.dsIndex = sm->config->parent_ds_index;
         SFLADD_ELEMENT(cs, &parElem);
     }
+
+    /* fill in an app-workers structure too, by querying the scoreboard just like in mod_status */
+    for (i = 0; i < sm->mpm_server_limit; ++i) {
+        ps_record = ap_get_scoreboard_process(i);
+        for (j = 0; j < sm->mpm_thread_limit; ++j) {
+#if ((AP_SERVER_MAJORVERSION_NUMBER < 3) && (AP_SERVER_MINORVERSION_NUMBER < 3))
+            ws_record = ap_get_scoreboard_worker(i, j);
+#else
+            ws_record = ap_get_scoreboard_worker_from_indexes(i, j);
+#endif
+            res = ws_record->status;
+        }
+    }
+    SFLADD_ELEMENT(cs, &app_workers);
 
     sfl_poller_writeCountersSample(poller, cs);
 }
@@ -1030,7 +1057,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     if((rc = apr_shm_create(&sm->shared_mem, sm->shared_bytes_total, NULL, p)) != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_shm_create() failed");
         /* may return ENOTIMPL if anon shared mem not supported,  in which case we */
-        /* should try again with a filename. $$$ */
+        /* TODO: should try again with a filename. */
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -1103,6 +1130,14 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 {
     void *flag;
     SFWB *sm = GET_CONFIG_DATA(s);
+    apr_status_t rc;
+
+    if(sm == NULL) {
+        /* not initialized yet - e.g. maybe this module was installed
+           without a subsequent restart,  and there was a graceful
+           restart on logrotate? */
+        return OK;
+    }
 
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u", getpid(),MYGETTID);
@@ -1137,6 +1172,39 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         }
 #endif
         
+
+        /* read the numbers we need for the scoreboard - might as well do it here in case the child processes ever
+           need to know it too,  but it's likely that only the sflow "master" will care */
+        if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS, &sm->mpm_thread_limit)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                         "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS) failed");
+        }
+
+        if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS, &sm->mpm_server_limit)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                         "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS) failed");
+        }
+
+        if((rc = ap_mpm_query(AP_MPMQ_MAX_THREADS, &sm->mpm_threads_per_child)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                         "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_THREADS) failed");
+        }
+        /* work around buggy MPMs - copied this check from mod_status */
+        if (sm->mpm_threads_per_child == 0) {
+            sm->mpm_threads_per_child = 1;
+        }
+
+        if((rc = ap_mpm_query(AP_MPMQ_MAX_DAEMONS, &sm->mpm_max_servers)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                         "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_DAEMONS) failed");
+        }
+
+        if((rc = ap_mpm_query(AP_MPMQ_IS_ASYNC, &sm->mpm_is_async)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                         "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_ASYNC) failed");
+        }
+
+        /* see if we need to fork the master */
         if(sm->sFlowProc == NULL) {
             start_sflow_master(p, s, sm);
         }
@@ -1390,6 +1458,12 @@ static apr_off_t get_bytes_in(request_rec *r)
 static int sflow_multi_log_transaction(request_rec *r)
 {
     SFWB *sm = GET_CONFIG_DATA(r->server);
+    if(sm == NULL) {
+        /* not initialized yet - e.g. maybe this module was installed
+           without a subsequent restart,  and there was a graceful
+           restart on logrotate? */
+        return OK;
+    }
     SFWBChild *child = sm->child;
     if(child->sflow_disabled) {
         /* Something bad happened, such as the pipe closing under our feet.

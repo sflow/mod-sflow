@@ -28,7 +28,9 @@ Installation (from rpm)
     $ rpm -Uvh mod-sflow-<version>.<os>.<arch>.rpm
 
   confirm that the mod_sflow.so file and related httpd.conf config
-  went to the right place, then restart apache.
+  went to the right place, then restart apache via:
+
+    $ apachectl restart
 
 Installation (direct from sources)
 ==================================
