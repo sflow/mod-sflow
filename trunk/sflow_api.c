@@ -1267,6 +1267,7 @@ static int computeCountersSampleSize(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
         switch(elem->tag) {
         case SFLCOUNTERS_HOST_PAR: elemSiz = 8 /*sizeof(elem->counterBlock.host_par)*/;  break;
         case SFLCOUNTERS_HTTP: elemSiz = XDRSIZ_SFLHTTP_COUNTERS /*sizeof(elem->counterBlock.http)*/;  break;
+        case SFLCOUNTERS_APP_WORKERS: elemSiz = XDRSIZ_APP_WORKERS /*sizeof(elem->counterBlock.app_workers)*/;  break;
         default:
             {
                 char errm[MAX_ERRMSG_LEN];
@@ -1356,6 +1357,13 @@ int sfl_receiver_writeCountersSample(SFLReceiver *receiver, SFL_COUNTERS_SAMPLE_
             putNet32(receiver, elem->counterBlock.http.status_4XX_count);
             putNet32(receiver, elem->counterBlock.http.status_5XX_count);
             putNet32(receiver, elem->counterBlock.http.status_other_count);
+            break;
+        case SFLCOUNTERS_APP_WORKERS:
+            putNet32(receiver, elem->counterBlock.app_workers.workers_active);
+            putNet32(receiver, elem->counterBlock.app_workers.workers_idle);
+            putNet32(receiver, elem->counterBlock.app_workers.workers_max);
+            putNet32(receiver, elem->counterBlock.app_workers.req_delayed);
+            putNet32(receiver, elem->counterBlock.app_workers.req_dropped);
             break;
         default:
             {
