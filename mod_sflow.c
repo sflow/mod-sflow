@@ -62,6 +62,21 @@
 **  here is that they are a lot less expensive than having a large number of
 **  threads contend for just one mutex on every transaction.
 **
+**  sFlow-APP-WORKERS
+**  =================
+**  Version 1.0.1 added the sFlow-APP-WORKERS export.  This sFlow structure
+**  was designed to allow agents to report worker-pool info (where the concept
+**  of "worker" can be abstracted to mean whatever makes sense for the application).
+**  Apache is a good example of an application where the pool of workers -- in
+**  this case threads -- does need to be monitored closely.  The essential
+**  code was copied from mod-status.  The only tricky step was that the
+**  forking of the sFlow "master" process had to be delayed until after the
+**  scoreboard was created,  so that it was acessible to that process via the
+**  inherited shared-memory handle.  The ap_hook_pre_mpm hook was used, but
+**  that hook is not called with the server_rec pointer,  so we had to stash that
+**  server_rec pointer in a static global-to-this-module pointer during the
+**  post_config hook, so that it could be picked up and used in the pre_mpm
+**  hook (ugly, but it works).
 **
 */ 
 
@@ -103,6 +118,12 @@
 
 /* sFlow library */
 #include "sflow_api.h"
+
+/* whether to include app_workers or not */
+#define SFWB_APP_WORKERS
+
+/* whether to enable even more logging/tracing */
+/* #define SFWB_DEBUG */
 
 #ifdef SFWB_DEBUG
 /* allow non-portable calls when debugging */
@@ -204,11 +225,14 @@ typedef struct _SFWB {
 #ifdef SFWB_DEBUG
     int mpm_threaded;
 #endif
+
+#ifdef SFWB_APP_WORKERS
     int mpm_thread_limit;
     int mpm_server_limit;
-    int mpm_threads_per_child;
-    int mpm_max_servers;
-    int mpm_is_async;
+    /* int mpm_threads_per_child; */
+    /* int mpm_max_servers; */
+    /* int mpm_is_async; */
+#endif
 
     /* master process */
     apr_proc_t *sFlowProc;
@@ -248,6 +272,20 @@ typedef struct _SFWBShared {
     apr_uint32_t sflow_skip;
     SFLCounters_sample_element http_counters;
 } SFWBShared;
+
+/*_________________---------------------------__________________
+  _________________      static vars          __________________
+  -----------------___________________________------------------
+*/
+
+#ifdef SFWB_APP_WORKERS
+/* global - to capture the server_rec from the post_config
+   stage so we can reference it at the pre_mpm stage, and to
+   allow logging from places that don't otherwise have the
+   server_rec context avaiable */
+static server_rec *sfwb_post_config_server_rec = NULL;
+static apr_pool_t *sfwb_post_config_pool = NULL;
+#endif
 
 /*_________________---------------------------__________________
   _________________   forward declarations    __________________
@@ -290,7 +328,7 @@ static int sfwb_cb_free(void *magic, SFLAgent *agent, void *obj)
 
 static void sfwb_cb_error(void *magic, SFLAgent *agent, char *msg)
 {
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, NULL, "sFlow agent error: %s", msg);
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, sfwb_post_config_server_rec, "sFlow agent error: %s", msg);
 }
 
 static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
@@ -298,11 +336,10 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
     SFWB *sm = (SFWB *)poller->magic;
     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
     SFLCounters_sample_element parElem = { 0 };
+#ifdef SFWB_APP_WORKERS
     SFLCounters_sample_element app_workers = { 0 };
-    apr_int32_t i, j, res;
-    worker_score *ws_record;
-    process_score *ps_record;
-        
+#endif
+
     if(sm->config == NULL) {
         /* config is disabled */
         return;
@@ -324,19 +361,59 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
         SFLADD_ELEMENT(cs, &parElem);
     }
 
-    /* fill in an app-workers structure too, by querying the scoreboard just like in mod_status */
-    for (i = 0; i < sm->mpm_server_limit; ++i) {
-        ps_record = ap_get_scoreboard_process(i);
-        for (j = 0; j < sm->mpm_thread_limit; ++j) {
+#ifdef SFWB_APP_WORKERS
+    if(ap_exists_scoreboard_image()) {
+        apr_int32_t i, j, res;
+        worker_score *ws_record;
+        process_score *ps_record;
+        ap_generation_t mpm_generation;
+
 #if ((AP_SERVER_MAJORVERSION_NUMBER < 3) && (AP_SERVER_MINORVERSION_NUMBER < 3))
-            ws_record = ap_get_scoreboard_worker(i, j);
+        mpm_generation = ap_my_generation;
 #else
-            ws_record = ap_get_scoreboard_worker_from_indexes(i, j);
-#endif
-            res = ws_record->status;
+        apr_status_t rc;
+        if((rc = ap_mpm_query(AP_MPMQ_GENERATION, &mpm_generation)) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, sfwb_post_config_server_rec,
+                         "sfwb_cb_counters: ap_mpm_query(AP_MPMQ_GENERATION) failed");
         }
+#endif
+        
+        /* fill in an app-workers structure too, by querying the scoreboard just like in mod_status */
+        app_workers.tag = SFLCOUNTERS_APP_WORKERS;
+        app_workers.counterBlock.app_workers.workers_max = sm->mpm_server_limit * sm->mpm_thread_limit;
+        
+        for (i = 0; i < sm->mpm_server_limit; i++) {
+            ps_record = ap_get_scoreboard_process(i);
+            if(ps_record) {
+                for (j = 0; j < sm->mpm_thread_limit; j++) {
+#if ((AP_SERVER_MAJORVERSION_NUMBER < 3) && (AP_SERVER_MINORVERSION_NUMBER < 3))
+                    ws_record = ap_get_scoreboard_worker(i, j);
+#else
+                    ws_record = ap_get_scoreboard_worker_from_indexes(i, j);
+#endif
+                    if(ws_record) {
+                        res = ws_record->status;
+                        if(!ps_record->quiescing
+                           && ps_record->pid) {
+                            if(res == SERVER_READY) {
+                                if(ps_record->generation == mpm_generation) {
+                                    app_workers.counterBlock.app_workers.workers_idle++;
+                                }
+                            }
+                            else if(res != SERVER_DEAD
+                                    && res != SERVER_STARTING
+                                    && res != SERVER_IDLE_KILL) {
+                                app_workers.counterBlock.app_workers.workers_active++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SFLADD_ELEMENT(cs, &app_workers);
     }
-    SFLADD_ELEMENT(cs, &app_workers);
+
+#endif /* SFWB_APP_WORKERS */
 
     sfl_poller_writeCountersSample(poller, cs);
 }
@@ -767,9 +844,10 @@ void sflow_tick(SFWB *sm, server_rec *s) {
     if(--sm->configCountDown <= 0) {
         apr_time_t modTime = configModified(sm, s);
         sm->configCountDown = SFWB_CONFIG_CHECK_S;
-
-        /* too verbose, even for LogLevel==debug */
-        /* ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "checking for config file change <%s>", sm->configFile); */
+        
+#ifdef SFWB_DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "checking for config file change <%s>", sm->configFile);
+#endif
 
         if(modTime == 0) {
             /* config file missing */
@@ -821,12 +899,12 @@ static apr_uint16_t lowestActiveListenPort(server_rec *s)
     }
 
     if(port == 0) {
-        // fallback - maybe the server_rec has a port number for us
+        /* fallback - maybe the server_rec has a port number for us */
         port = s->port;
     }
 
     if(port == 0) {
-        // ultimate fallback - the hard-coded default
+        /* ultimate fallback - the hard-coded default */
         port = DEFAULT_HTTP_PORT;
     }
     return port;
@@ -1052,7 +1130,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     /* The write-end of the pipe must be non-blocking to ensure that worker-threads are never stalled. */
     apr_file_pipe_timeout_set(sm->pipe_write, 0);
 
-    /* create anonymous shared memory for the sFlow agent structures and packet buffer */
+    /* create anonymous shared memory for counters and for pushing config to the workers */
     sm->shared_bytes_total = sizeof(SFWBShared);
     if((rc = apr_shm_create(&sm->shared_mem, sm->shared_bytes_total, NULL, p)) != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_shm_create() failed");
@@ -1069,6 +1147,10 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     shared->http_counters.tag = SFLCOUNTERS_HTTP;
 
     sm->sFlowProc = apr_palloc(p, sizeof(apr_proc_t));
+
+#ifdef SFWB_DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
+#endif
 
     switch(rc = apr_proc_fork(sm->sFlowProc, p)) {
     case APR_INCHILD:
@@ -1172,7 +1254,7 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         }
 #endif
         
-
+#ifdef SFWB_APP_WORKERS
         /* read the numbers we need for the scoreboard - might as well do it here in case the child processes ever
            need to know it too,  but it's likely that only the sflow "master" will care */
         if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS, &sm->mpm_thread_limit)) != APR_SUCCESS) {
@@ -1185,32 +1267,71 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
                          "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS) failed");
         }
 
-        if((rc = ap_mpm_query(AP_MPMQ_MAX_THREADS, &sm->mpm_threads_per_child)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
-                         "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_THREADS) failed");
-        }
-        /* work around buggy MPMs - copied this check from mod_status */
-        if (sm->mpm_threads_per_child == 0) {
-            sm->mpm_threads_per_child = 1;
-        }
+        /* if((rc = ap_mpm_query(AP_MPMQ_MAX_THREADS, &sm->mpm_threads_per_child)) != APR_SUCCESS) { */
+        /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
+        /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_THREADS) failed"); */
+        /* } */
+        /* /\* work around buggy MPMs - copied this check from mod_status *\/ */
+        /* if (sm->mpm_threads_per_child == 0) { */
+        /*     sm->mpm_threads_per_child = 1; */
+        /* } */
 
-        if((rc = ap_mpm_query(AP_MPMQ_MAX_DAEMONS, &sm->mpm_max_servers)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
-                         "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_DAEMONS) failed");
-        }
+        /* if((rc = ap_mpm_query(AP_MPMQ_MAX_DAEMONS, &sm->mpm_max_servers)) != APR_SUCCESS) { */
+        /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
+        /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_DAEMONS) failed"); */
+        /* } */
 
-        if((rc = ap_mpm_query(AP_MPMQ_IS_ASYNC, &sm->mpm_is_async)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
-                         "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_ASYNC) failed");
-        }
+        /* if((rc = ap_mpm_query(AP_MPMQ_IS_ASYNC, &sm->mpm_is_async)) != APR_SUCCESS) { */
+        /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
+        /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_ASYNC) failed"); */
+        /* } */
 
+        /* cache the server_rec and pool pointers here so they can be available
+           to the pre_mpm hook below */
+        sfwb_post_config_server_rec = s;
+        sfwb_post_config_pool = p;
+#else
         /* see if we need to fork the master */
         if(sm->sFlowProc == NULL) {
             start_sflow_master(p, s, sm);
         }
+#endif /* SFWB_APP_WORKERS */
     }
     return OK;
 }
+
+#ifdef SFWB_APP_WORKERS
+/*_________________---------------------------__________________
+  _________________     sflow_pre_mpm         __________________
+  -----------------___________________________------------------
+*/
+
+static int sflow_pre_mpm(apr_pool_t *pool, ap_scoreboard_e sbtype)
+{
+    /* pick up the server_rec and pool pointers that we stashed in the post_config hook.
+       We might have been able to use the pool that was passed to us here (and it might
+       even be the same pool) but it's more conservative to keep using the same one from
+       the post_config hook that we always used before */
+    server_rec *s = sfwb_post_config_server_rec;
+    apr_pool_t *p = sfwb_post_config_pool;
+    SFWB *sm = GET_CONFIG_DATA(s);
+    /* what should we do if sbtype == SB_NOT_SHARED? */
+
+#ifdef SFWB_DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_pre_mpm - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
+#endif
+
+    /* see if we need to fork the master */
+    /* By delaying this to here, we ensure that the scoreboard has
+       already been created.  That means the sflow_master process
+       will inherit it (i.e. inherit the shared-memory handle) and
+       will then be able to walk it to read out the worker stats. */
+    if(sm && sm->sFlowProc == NULL) {
+        start_sflow_master(p, s, sm);
+    }
+    return OK;
+}
+#endif /* SFWB_APP_WORKERS */
 
 /*_________________---------------------------__________________
   _________________  child agent callbacks    __________________
@@ -1243,8 +1364,13 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
     apr_status_t rc;
     SFWB *sm = GET_CONFIG_DATA(s);
+
+    if(sm == NULL) {
+        return;
+    }
+
 #ifdef SFWB_DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u", getpid(),MYGETTID);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
 #endif
 
     /* create my own private state, and hang it off the shared state */
@@ -1712,6 +1838,9 @@ static int sflow_handler(request_rec *r)
 static void sflow_register_hooks(apr_pool_t *p)
 {
     ap_hook_post_config(sflow_post_config,NULL,NULL,APR_HOOK_MIDDLE);
+#ifdef SFWB_APP_WORKERS
+    ap_hook_pre_mpm(sflow_pre_mpm, NULL, NULL, APR_HOOK_LAST);
+#endif
     ap_hook_child_init(sflow_init_child,NULL,NULL,APR_HOOK_MIDDLE);
     ap_hook_handler(sflow_handler, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_log_transaction(sflow_multi_log_transaction,NULL,NULL,APR_HOOK_MIDDLE);
