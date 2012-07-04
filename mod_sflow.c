@@ -76,7 +76,11 @@
 **  that hook is not called with the server_rec pointer,  so we had to stash that
 **  server_rec pointer in a static global-to-this-module pointer during the
 **  post_config hook, so that it could be picked up and used in the pre_mpm
-**  hook (ugly, but it works).
+**  hook (ugly, but it seems to work).
+**  By delaying the forking of the sFlow "master" process we also get to
+**  load smoothly on a single SIGHUP,  because we can allow the post_config
+**  hook to run regardless of whether is going to run once or twice (as it
+**  does on a full startup sequence).
 **
 */ 
 
@@ -123,7 +127,7 @@
 #define SFWB_APP_WORKERS
 
 /* whether to enable even more logging/tracing */
-/* #define SFWB_DEBUG */
+/*#define SFWB_DEBUG */
 
 #ifdef SFWB_DEBUG
 /* allow non-portable calls when debugging */
@@ -1212,7 +1216,9 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
     /* be careful in case we are not initialized yet - e.g. maybe this module was installed
-       without a subsequent restart,  and there was a graceful restart on logrotate */
+       without a subsequent restart,  and there was a graceful restart on logrotate.
+       http://wiki.apache.org/httpd/ModuleLife */
+
     if(s == NULL) {
         return OK;
     }
@@ -1222,21 +1228,27 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
         return OK;
     }
 
-    void *flag;
     apr_status_t rc;
     
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u", getpid(),MYGETTID);
 #endif
     
-    /* All post_config hooks are called twice, we're only interested in the second call. */
+#ifdef SFWB_APP_WORKERS
+    /* don't need to wait for second post_config call because we are not going to call start_sflow_master() until later.
+       Just allow the code below to run twice.  The advantage is that now mod-sflow can be loaded into a running
+       apache with just one SIGHUP instead of requriing two. See http://wiki.apache.org/httpd/ModuleLife */
+#else
+    /* All post_config hooks are called twice on a full restart, we're only interested in the second call. */
+    void *flag;
     apr_pool_userdata_get(&flag, MOD_SFLOW_USERDATA_KEY, s->process->pool);
     if (!flag) {
         apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY, apr_pool_cleanup_null, s->process->pool);
         return OK;
     }
-            
     /* get here on the second call... */
+#endif
+            
             
     /* try to retrieve the optional fn pointer from mod_logio that allows us to report both bytes_in and bytes_out */
     if(!pfn_ap_logio_get_last_bytes) {
