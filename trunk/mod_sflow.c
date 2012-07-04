@@ -240,6 +240,7 @@ typedef struct _SFWB {
     apr_pool_t *configPool;
 
     /* master config */
+    bool_t initOK;
     apr_time_t currentTime;
     apr_int32_t configCountDown;
     char *configFile;
@@ -1210,30 +1211,33 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 
 static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
-    void *flag;
-    SFWB *sm = GET_CONFIG_DATA(s);
-    apr_status_t rc;
-
-    if(sm == NULL) {
-        /* not initialized yet - e.g. maybe this module was installed
-           without a subsequent restart,  and there was a graceful
-           restart on logrotate? */
+    /* be careful in case we are not initialized yet - e.g. maybe this module was installed
+       without a subsequent restart,  and there was a graceful restart on logrotate */
+    if(s == NULL) {
         return OK;
     }
 
+    SFWB *sm = GET_CONFIG_DATA(s);
+    if(sm == NULL) {
+        return OK;
+    }
+
+    void *flag;
+    apr_status_t rc;
+    
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - pid=%u,tid=%u", getpid(),MYGETTID);
 #endif
-
+    
     /* All post_config hooks are called twice, we're only interested in the second call. */
     apr_pool_userdata_get(&flag, MOD_SFLOW_USERDATA_KEY, s->process->pool);
     if (!flag) {
         apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY, apr_pool_cleanup_null, s->process->pool);
         return OK;
     }
-    
+            
     /* get here on the second call... */
-
+            
     /* try to retrieve the optional fn pointer from mod_logio that allows us to report both bytes_in and bytes_out */
     if(!pfn_ap_logio_get_last_bytes) {
         pfn_ap_logio_get_last_bytes = APR_RETRIEVE_OPTIONAL_FN(ap_logio_get_last_bytes);
@@ -1241,62 +1245,62 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "unable to retrieve optional fn ap_logio_get_last_bytes() -- perhaps mod logio not loaded?");
         }
     }
-
-    if(sm) {
-        
+            
 #ifdef SFWB_DEBUG
-        if((rc = ap_mpm_query(AP_MPMQ_IS_THREADED, &sm->mpm_threaded)) == APR_SUCCESS) {
-            /* We could use this information to decided whether to create the mutex in each child */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u", sm->mpm_threaded);
-        }
-        else {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed");
-        }
-#endif
-        
-#ifdef SFWB_APP_WORKERS
-        /* read the numbers we need for the scoreboard - might as well do it here in case the child processes ever
-           need to know it too,  but it's likely that only the sflow "master" will care */
-        if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS, &sm->mpm_thread_limit)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
-                         "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS) failed");
-        }
-
-        if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS, &sm->mpm_server_limit)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
-                         "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS) failed");
-        }
-
-        /* if((rc = ap_mpm_query(AP_MPMQ_MAX_THREADS, &sm->mpm_threads_per_child)) != APR_SUCCESS) { */
-        /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
-        /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_THREADS) failed"); */
-        /* } */
-        /* /\* work around buggy MPMs - copied this check from mod_status *\/ */
-        /* if (sm->mpm_threads_per_child == 0) { */
-        /*     sm->mpm_threads_per_child = 1; */
-        /* } */
-
-        /* if((rc = ap_mpm_query(AP_MPMQ_MAX_DAEMONS, &sm->mpm_max_servers)) != APR_SUCCESS) { */
-        /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
-        /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_DAEMONS) failed"); */
-        /* } */
-
-        /* if((rc = ap_mpm_query(AP_MPMQ_IS_ASYNC, &sm->mpm_is_async)) != APR_SUCCESS) { */
-        /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
-        /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_ASYNC) failed"); */
-        /* } */
-
-        /* cache the server_rec and pool pointers here so they can be available
-           to the pre_mpm hook below */
-        sfwb_post_config_server_rec = s;
-        sfwb_post_config_pool = p;
-#else
-        /* see if we need to fork the master */
-        if(sm->sFlowProc == NULL) {
-            start_sflow_master(p, s, sm);
-        }
-#endif /* SFWB_APP_WORKERS */
+    if((rc = ap_mpm_query(AP_MPMQ_IS_THREADED, &sm->mpm_threaded)) == APR_SUCCESS) {
+        /* We could use this information to decided whether to create the mutex in each child */
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_post_config - threaded=%u", sm->mpm_threaded);
     }
+    else {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_THREADED) failed");
+    }
+#endif
+            
+#ifdef SFWB_APP_WORKERS
+    /* read the numbers we need for the scoreboard - might as well do it here in case the child processes ever
+       need to know it too,  but it's likely that only the sflow "master" will care */
+    if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS, &sm->mpm_thread_limit)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                     "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS) failed");
+    }
+            
+    if((rc = ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS, &sm->mpm_server_limit)) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s,
+                     "sflow_post_config - ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS) failed");
+    }
+            
+    /* if((rc = ap_mpm_query(AP_MPMQ_MAX_THREADS, &sm->mpm_threads_per_child)) != APR_SUCCESS) { */
+    /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
+    /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_THREADS) failed"); */
+    /* } */
+    /* /\* work around buggy MPMs - copied this check from mod_status *\/ */
+    /* if (sm->mpm_threads_per_child == 0) { */
+    /*     sm->mpm_threads_per_child = 1; */
+    /* } */
+            
+    /* if((rc = ap_mpm_query(AP_MPMQ_MAX_DAEMONS, &sm->mpm_max_servers)) != APR_SUCCESS) { */
+    /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
+    /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_MAX_DAEMONS) failed"); */
+    /* } */
+            
+    /* if((rc = ap_mpm_query(AP_MPMQ_IS_ASYNC, &sm->mpm_is_async)) != APR_SUCCESS) { */
+    /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
+    /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_ASYNC) failed"); */
+    /* } */
+            
+    /* cache the server_rec and pool pointers here so they can be available
+       to the pre_mpm hook below */
+    sfwb_post_config_server_rec = s;
+    sfwb_post_config_pool = p;
+#else
+    /* see if we need to fork the master */
+    if(sm->sFlowProc == NULL) {
+        start_sflow_master(p, s, sm);
+    }
+#endif /* SFWB_APP_WORKERS */
+
+    /* record the fact that we were initialized in the expected way */
+    sm->initOK = true;
     return OK;
 }
 
@@ -1314,19 +1318,30 @@ static int sflow_pre_mpm(apr_pool_t *pool, ap_scoreboard_e sbtype)
        the post_config hook that we always used before */
     server_rec *s = sfwb_post_config_server_rec;
     apr_pool_t *p = sfwb_post_config_pool;
+    if(s == NULL || p == NULL) {
+        /* be careful in case we are not initialized yet - e.g. maybe this module was installed
+           without a subsequent restart,  and there was a graceful restart on logrotate */
+        return OK;
+    }
+    
     SFWB *sm = GET_CONFIG_DATA(s);
-    /* what should we do if sbtype == SB_NOT_SHARED? */
+    if(sm == NULL
+       || sm->initOK == false) {
+        return OK;
+    }
 
+    /* what should we do if sbtype == SB_NOT_SHARED? */
+    
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_pre_mpm - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
 #endif
-
+    
     /* see if we need to fork the master */
     /* By delaying this to here, we ensure that the scoreboard has
        already been created.  That means the sflow_master process
        will inherit it (i.e. inherit the shared-memory handle) and
        will then be able to walk it to read out the worker stats. */
-    if(sm && sm->sFlowProc == NULL) {
+    if(sm->sFlowProc == NULL) {
         start_sflow_master(p, s, sm);
     }
     return OK;
@@ -1362,12 +1377,20 @@ static void sfwb_childcb_error(void *magic, SFLAgent *agent, char *msg)
 
 static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
-    apr_status_t rc;
-    SFWB *sm = GET_CONFIG_DATA(s);
-
-    if(sm == NULL) {
+    /* be careful in case we are not initialized yet - e.g. maybe this module was installed
+       without a subsequent restart,  and there was a graceful restart on logrotate */
+    if(s == NULL) {
         return;
     }
+    SFWB *sm = GET_CONFIG_DATA(s);
+
+    if(sm == NULL
+       || sm->shared_mem == NULL
+       || sm->initOK == false) {
+        return;
+    }
+    
+    apr_status_t rc;
 
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_init_child - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
@@ -1583,15 +1606,21 @@ static apr_off_t get_bytes_in(request_rec *r)
 
 static int sflow_multi_log_transaction(request_rec *r)
 {
+    if(r == NULL
+       || r->server == NULL) {
+        return OK;
+    }
     SFWB *sm = GET_CONFIG_DATA(r->server);
-    if(sm == NULL) {
+    if(sm == NULL
+       || sm->initOK == false) {
         /* not initialized yet - e.g. maybe this module was installed
            without a subsequent restart,  and there was a graceful
            restart on logrotate? */
         return OK;
     }
     SFWBChild *child = sm->child;
-    if(child->sflow_disabled) {
+    if(child->sflow_disabled
+       || child->sampler == NULL) {
         /* Something bad happened, such as the pipe closing under our feet.
            Do nothing more. Just wait for the men in white coats. */
         return OK;
@@ -1794,6 +1823,10 @@ static int sflow_multi_log_transaction(request_rec *r)
 
 static int sflow_handler(request_rec *r)
 {
+    if(r == NULL
+       || r->handler == NULL) {
+        return OK;
+    }
     if (strcmp(r->handler, "sflow")) {
         return DECLINED;
     }
