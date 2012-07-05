@@ -38,11 +38,15 @@ Installation (direct from sources)
   Compile and install the module into Apache's modules directory 
   and add it to the apache httpd.conf config file by running:
 
+    $ rm -f `apxs -q LIBEXECDIR`/mod_sflow.so
     $ apxs -c -i -a mod_sflow.c sflow_api.c
 
   Then restart Apache via:
 
     $ apachectl restart
+
+  Note:  the first step where the module is removed is important as
+  a workaround for Apache bug #47951.
 
 Configuration
 =============
