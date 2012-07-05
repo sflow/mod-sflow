@@ -1022,9 +1022,15 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 
     /* now loop forever - unless we encounter some kind of error */
     for(;;) {
-
+ 
         /* send ticks */
+        /* segfaults here if mod_sflow.so is overwritten.  Need to remove it first,  then copy in the
+           new one!  apxs(1) will just overwrite the file,  so this is an important step to observe when
+           upgrading (see apache bug #47951 - apparently fixed in version 2.4.1).
+           rpm will remove the previous file before installing the new one,  so it's not an issue if you
+           use rpm. */
         apr_time_t now = apr_time_sec(apr_time_now());
+
         if(sm->currentTime != now) {
             sflow_tick(sm, s);
             sm->currentTime = now;
@@ -1107,8 +1113,9 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         }
     }
 
-    /* We only get here if there was an unexpected message error that caused us to break out of the loop above */
+    /* We should only get here if there was an unexpected message error that caused us to break out of the loop above */    
     ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error");
+
     return APR_CHILD_DONE;
 }
 
@@ -1163,16 +1170,18 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
         apr_file_close(sm->pipe_write);
         /* and run the master */
         run_sflow_master(p, s, sm);
-        /* if anything goes wrong, we'll get here.  Just exit
-           the process.  This is likely to result in pipe write
-           errors in any child that is still running */
-        exit(1);
+        /* if anything goes wrong, we'll get here.  Just allow
+           the process to terminate.  This is likely to result
+           in pipe write errors in any child that is still running */
         break;
     case APR_INPARENT:
         /* close the read end of the pipe */
         apr_file_close(sm->pipe_read);
-        /* make sure apache knows to kill this process too if it is cleaning up */
-        apr_pool_note_subprocess(p, sm->sFlowProc, APR_KILL_AFTER_TIMEOUT);
+        /* make sure apache knows to kill this process too if it is cleaning up.
+           We had APR_KILL_AFTER_TIMEOUT here before,  but really there's no need
+           to send SIGTERM and then hang around politely. We can shoot first and
+           ask questions later. */
+        apr_pool_note_subprocess(p, sm->sFlowProc, /*APR_KILL_AFTER_TIMEOUT*/ APR_KILL_ALWAYS);
         break;
     default:
         ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_fork() failed");
@@ -1219,7 +1228,8 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
        without a subsequent restart,  and there was a graceful restart on logrotate.
        http://wiki.apache.org/httpd/ModuleLife */
 
-    if(s == NULL) {
+    if(s == NULL
+       || s->module_config == NULL) {
         return OK;
     }
 
@@ -1330,9 +1340,10 @@ static int sflow_pre_mpm(apr_pool_t *pool, ap_scoreboard_e sbtype)
        the post_config hook that we always used before */
     server_rec *s = sfwb_post_config_server_rec;
     apr_pool_t *p = sfwb_post_config_pool;
-    if(s == NULL || p == NULL) {
-        /* be careful in case we are not initialized yet - e.g. maybe this module was installed
-           without a subsequent restart,  and there was a graceful restart on logrotate */
+
+    if(s == NULL
+       || p == NULL
+       || s->module_config == NULL) {
         return OK;
     }
     
@@ -1391,9 +1402,11 @@ static void sflow_init_child(apr_pool_t *p, server_rec *s)
 {
     /* be careful in case we are not initialized yet - e.g. maybe this module was installed
        without a subsequent restart,  and there was a graceful restart on logrotate */
-    if(s == NULL) {
+    if(s == NULL
+       || s->module_config == NULL) {
         return;
     }
+
     SFWB *sm = GET_CONFIG_DATA(s);
 
     if(sm == NULL
@@ -1619,10 +1632,13 @@ static apr_off_t get_bytes_in(request_rec *r)
 static int sflow_multi_log_transaction(request_rec *r)
 {
     if(r == NULL
-       || r->server == NULL) {
+       || r->server == NULL
+       || r->server->module_config == NULL) {
         return OK;
     }
+
     SFWB *sm = GET_CONFIG_DATA(r->server);
+
     if(sm == NULL
        || sm->initOK == false) {
         /* not initialized yet - e.g. maybe this module was installed
@@ -1837,11 +1853,13 @@ static int sflow_handler(request_rec *r)
 {
     if(r == NULL
        || r->handler == NULL) {
-        return OK;
+        return DECLINED;
     }
+
     if (strcmp(r->handler, "sflow")) {
         return DECLINED;
     }
+
     r->content_type = "text/plain";      
 
     if (!r->header_only) {
