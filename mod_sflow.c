@@ -23,9 +23,9 @@
 **  from the various child processes (and threads within them) that may
 **  be handling HTTP requests.
 **
-**  The post_config hook forks a separate process and open a pipe
-**  to it.  This process runs the "master" sFlow agent that will actually
-**  read the sFlow configuration and send UDP datagrams to the collector.
+**  Either the post_config or the pre_mpm hook forks a separate process and
+**  opens a pipe to it.  This process runs the "master" sFlow agent that will
+**  actually read the sFlow configuration and send UDP datagrams to the collector.
 **
 **  A small shared-memory segment is created too.  Each child process that
 **  Apache subsequently forks will inherit handles for both the pipe and the
@@ -73,14 +73,30 @@
 **  forking of the sFlow "master" process had to be delayed until after the
 **  scoreboard was created,  so that it was acessible to that process via the
 **  inherited shared-memory handle.  The ap_hook_pre_mpm hook was used, but
-**  that hook is not called with the server_rec pointer,  so we had to stash that
-**  server_rec pointer in a static global-to-this-module pointer during the
-**  post_config hook, so that it could be picked up and used in the pre_mpm
-**  hook (ugly, but it seems to work).
-**  By delaying the forking of the sFlow "master" process we also get to
-**  load smoothly on a single SIGHUP,  because we can allow the post_config
-**  hook to run regardless of whether is going to run once or twice (as it
-**  does on a full startup sequence).
+**  that hook is not called with the server_rec pointer,  so we had to store that
+**  server_rec pointer as user-data in the pool so that it could be picked up and
+**  used in the pre_mpm hook.
+**
+**  Full, SIGHUP and graceful (SIGUSR1) restarts
+**  ============================================
+**  These three scenarios all have to be handled differently:
+**
+**  Full restart:
+**  post_config hook called twice, then pre_mpm hook.
+**  sflow_master process forked from pre_mpm hook (after scoreboard created)
+**
+**  SIGHUP restart:
+**  post_config hook called only once, then pre_mpm hook.
+**  sflow_master process forked from pre_mpm hook (after scoreboard created)
+**
+**  graceful (SIGUSR1) restart:
+**  post_config hook called only once
+**  However the scoreboard persists, so the sflow_master process can be
+**  forked from the post_config hook and still access the scoreboard
+**
+**  Because the same parent process is involved in all cases, we are
+**  able to store user-data flags in the process->pool that tell us
+**  which scenario we are in.
 **
 */ 
 
@@ -127,7 +143,7 @@
 #define SFWB_APP_WORKERS
 
 /* whether to enable even more logging/tracing */
-/*#define SFWB_DEBUG */
+/* #define SFWB_DEBUG */
 
 #ifdef SFWB_DEBUG
 /* allow non-portable calls when debugging */
@@ -148,7 +164,17 @@ typedef apr_uint32_t bool_t;
   -----------------___________________________------------------
 */
 
-#define MOD_SFLOW_USERDATA_KEY "mod-sflow"
+/* process user-data flag to know that the post_config hook has been called */
+#define MOD_SFLOW_USERDATA_KEY_POSTCONFIG "mod-sflow-post-config"
+
+/* process flag to know that the pre_mpm hook has been called */
+#define MOD_SFLOW_USERDATA_KEY_PREMPM "mod-sflow-pre-mpm"
+
+/* process level var used to store the post_config server_rec pointer
+   (to make it available to the post_mpm hook and for logging from
+   the sflow_master process) */
+#define MOD_SFLOW_USERDATA_KEY_POSTCONFIG_SERVERREC "mod-sflow-server-rec"
+
 module AP_MODULE_DECLARE_DATA sflow_module;
 
 #define GET_CONFIG_DATA(s) ap_get_module_config((s)->module_config, &sflow_module)
@@ -242,6 +268,7 @@ typedef struct _SFWB {
     apr_proc_t *sFlowProc;
     apr_pool_t *masterPool;
     apr_pool_t *configPool;
+    server_rec *server_rec;
 
     /* master config */
     bool_t initOK;
@@ -277,20 +304,6 @@ typedef struct _SFWBShared {
     apr_uint32_t sflow_skip;
     SFLCounters_sample_element http_counters;
 } SFWBShared;
-
-/*_________________---------------------------__________________
-  _________________      static vars          __________________
-  -----------------___________________________------------------
-*/
-
-#ifdef SFWB_APP_WORKERS
-/* global - to capture the server_rec from the post_config
-   stage so we can reference it at the pre_mpm stage, and to
-   allow logging from places that don't otherwise have the
-   server_rec context avaiable */
-static server_rec *sfwb_post_config_server_rec = NULL;
-static apr_pool_t *sfwb_post_config_pool = NULL;
-#endif
 
 /*_________________---------------------------__________________
   _________________   forward declarations    __________________
@@ -333,7 +346,8 @@ static int sfwb_cb_free(void *magic, SFLAgent *agent, void *obj)
 
 static void sfwb_cb_error(void *magic, SFLAgent *agent, char *msg)
 {
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, sfwb_post_config_server_rec, "sFlow agent error: %s", msg);
+    SFWB *sm = (SFWB *)magic;
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, sm->server_rec, "sFlow agent error: %s", msg);
 }
 
 static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE_TYPE *cs)
@@ -378,7 +392,7 @@ static void sfwb_cb_counters(void *magic, SFLPoller *poller, SFL_COUNTERS_SAMPLE
 #else
         apr_status_t rc;
         if((rc = ap_mpm_query(AP_MPMQ_GENERATION, &mpm_generation)) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, sfwb_post_config_server_rec,
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, sm->server_rec,
                          "sfwb_cb_counters: ap_mpm_query(AP_MPMQ_GENERATION) failed");
         }
 #endif
@@ -997,6 +1011,12 @@ static void sflow_init(SFWB *sm, server_rec *s)
             SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
             shared->sflow_skip = sm->config->sampling_n;
         }
+
+#ifdef SFWB_DEBUG
+        /* test the agent error reporting mechanism to make sure it is working */
+        sfl_agent_error(sm->agent, "error-log-test", "agent init complete");
+#endif
+
     }
 }
 
@@ -1009,6 +1029,7 @@ static void sflow_init(SFWB *sm, server_rec *s)
 static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 {
     apr_status_t rc;
+    bool_t pipe_err = false;
 
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master - pid=%u", getpid());
@@ -1022,7 +1043,7 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 
     /* now loop forever - unless we encounter some kind of error */
     for(;;) {
- 
+
         /* send ticks */
         /* segfaults here if mod_sflow.so is overwritten.  Need to remove it first,  then copy in the
            new one!  apxs(1) will just overwrite the file,  so this is an important step to observe when
@@ -1045,7 +1066,8 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         rc = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
         if(rc != APR_SUCCESS && !(APR_STATUS_IS_TIMEUP(rc))) {
             ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
-            return rc;
+            pipe_err = true;
+            break;
         }
 
         if(rc == APR_SUCCESS && hdrBytesRead != 0) {
@@ -1069,7 +1091,8 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             apr_size_t bodyBytesRead = 0;
             if((rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead)) != APR_SUCCESS) {
                 ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
-                return rc;
+                pipe_err = true;
+                break;
             }
 
             if(bodyBytesRead != bodyBytes) break;
@@ -1112,10 +1135,14 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             }
         }
     }
-
-    /* We should only get here if there was an unexpected message error that caused us to break out of the loop above */    
-    ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error");
-
+    
+    /* The pipe errors are what we actually expect to see if apache is restarted with SIGHUP or graceful(SIGUSR1), so only
+       log an error if we see something else */
+    if(!pipe_err) {
+        /* We should only get here if there was an unexpected message error that caused us to break out of the loop above */    
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error");
+    }
+    
     return APR_CHILD_DONE;
 }
 
@@ -1181,7 +1208,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
            We had APR_KILL_AFTER_TIMEOUT here before,  but really there's no need
            to send SIGTERM and then hang around politely. We can shoot first and
            ask questions later. */
-        apr_pool_note_subprocess(p, sm->sFlowProc, /*APR_KILL_AFTER_TIMEOUT*/ APR_KILL_ALWAYS);
+        apr_pool_note_subprocess(p, sm->sFlowProc, /* APR_KILL_AFTER_TIMEOUT */ APR_KILL_ALWAYS);
         break;
     default:
         ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_fork() failed");
@@ -1224,6 +1251,9 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 
 static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
+    void *post_config_flag = NULL;
+    void *pre_mpm_flag = NULL;
+
     /* be careful in case we are not initialized yet - e.g. maybe this module was installed
        without a subsequent restart,  and there was a graceful restart on logrotate.
        http://wiki.apache.org/httpd/ModuleLife */
@@ -1247,13 +1277,12 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 #ifdef SFWB_APP_WORKERS
     /* don't need to wait for second post_config call because we are not going to call start_sflow_master() until later.
        Just allow the code below to run twice.  The advantage is that now mod-sflow can be loaded into a running
-       apache with just one SIGHUP instead of requriing two. See http://wiki.apache.org/httpd/ModuleLife */
+       apache with just one SIGHUP instead of requring two. See http://wiki.apache.org/httpd/ModuleLife */
 #else
     /* All post_config hooks are called twice on a full restart, we're only interested in the second call. */
-    void *flag;
-    apr_pool_userdata_get(&flag, MOD_SFLOW_USERDATA_KEY, s->process->pool);
-    if (!flag) {
-        apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY, apr_pool_cleanup_null, s->process->pool);
+    apr_pool_userdata_get(&post_config_flag, MOD_SFLOW_USERDATA_KEY_POSTCONFIG, s->process->pool);
+    if (!post_config_flag) {
+        apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY_POSTCONFIG, apr_pool_cleanup_null, s->process->pool);
         return OK;
     }
     /* get here on the second call... */
@@ -1309,11 +1338,20 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
     /*     ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, */
     /*                  "sflow_post_config - ap_mpm_query(AP_MPMQ_IS_ASYNC) failed"); */
     /* } */
-            
-    /* cache the server_rec and pool pointers here so they can be available
-       to the pre_mpm hook below */
-    sfwb_post_config_server_rec = s;
-    sfwb_post_config_pool = p;
+
+    /* cache the server_rec pointer so it can be used for logging from the sflow_master process */
+    sm->server_rec = s;
+
+    /* also cache the server_rec pointer as pool user-data so it can be available to the pre_mpm hook that follows */
+    apr_pool_userdata_set((void*) s, MOD_SFLOW_USERDATA_KEY_POSTCONFIG_SERVERREC, apr_pool_cleanup_null, s->process->pool);
+
+    /* See if the pre_mpm hook was called before (i.e. see if this is a graceful restart) */
+    apr_pool_userdata_get(&pre_mpm_flag, MOD_SFLOW_USERDATA_KEY_PREMPM, s->process->pool);
+    if(sm->sFlowProc == NULL
+       && pre_mpm_flag) {
+        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s, "mod_sflow detected graceful restart");
+        start_sflow_master(p, s, sm);
+    }
 #else
     /* see if we need to fork the master */
     if(sm->sFlowProc == NULL) {
@@ -1334,15 +1372,12 @@ static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp,
 
 static int sflow_pre_mpm(apr_pool_t *pool, ap_scoreboard_e sbtype)
 {
-    /* pick up the server_rec and pool pointers that we stashed in the post_config hook.
-       We might have been able to use the pool that was passed to us here (and it might
-       even be the same pool) but it's more conservative to keep using the same one from
-       the post_config hook that we always used before */
-    server_rec *s = sfwb_post_config_server_rec;
-    apr_pool_t *p = sfwb_post_config_pool;
-
+    /* pick up the server_rec pointer that we stashed in the post_config hook. Note that
+       we are assuming that the pool we were given here is the s->process->pool */
+    server_rec *s = NULL;
+    apr_pool_userdata_get((void **)&s, MOD_SFLOW_USERDATA_KEY_POSTCONFIG_SERVERREC, pool);
+    
     if(s == NULL
-       || p == NULL
        || s->module_config == NULL) {
         return OK;
     }
@@ -1356,7 +1391,12 @@ static int sflow_pre_mpm(apr_pool_t *pool, ap_scoreboard_e sbtype)
     /* what should we do if sbtype == SB_NOT_SHARED? */
     
 #ifdef SFWB_DEBUG
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "sflow_pre_mpm - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s,
+                 "sflow_pre_mpm - pid=%u,tid=%u,scoreboard=%s,server_rec_OK=%s",
+                 getpid(),
+                 MYGETTID,
+                 ap_exists_scoreboard_image() ? "YES":"NO",
+                 (s == sm->server_rec) ? "YES":"NO");
 #endif
     
     /* see if we need to fork the master */
@@ -1365,8 +1405,13 @@ static int sflow_pre_mpm(apr_pool_t *pool, ap_scoreboard_e sbtype)
        will inherit it (i.e. inherit the shared-memory handle) and
        will then be able to walk it to read out the worker stats. */
     if(sm->sFlowProc == NULL) {
-        start_sflow_master(p, s, sm);
+        start_sflow_master(pool, s, sm);
     }
+
+    /* remember that we got here - so we know the difference
+       between a full restart and a graceful restart */
+    apr_pool_userdata_set((void*) 1, MOD_SFLOW_USERDATA_KEY_PREMPM, apr_pool_cleanup_null, pool);
+
     return OK;
 }
 #endif /* SFWB_APP_WORKERS */
@@ -1647,7 +1692,8 @@ static int sflow_multi_log_transaction(request_rec *r)
         return OK;
     }
     SFWBChild *child = sm->child;
-    if(child->sflow_disabled
+    if(child == NULL
+       || child->sflow_disabled
        || child->sampler == NULL) {
         /* Something bad happened, such as the pipe closing under our feet.
            Do nothing more. Just wait for the men in white coats. */
