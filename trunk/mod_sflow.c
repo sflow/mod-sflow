@@ -175,6 +175,9 @@ typedef apr_uint32_t bool_t;
    the sflow_master process) */
 #define MOD_SFLOW_USERDATA_KEY_POSTCONFIG_SERVERREC "mod-sflow-server-rec"
 
+/* process level var used to store a handle on the sflow_master process */
+#define MOD_SFLOW_USERDATA_KEY_SFLOWMASTER "mod-sflow-master"
+
 module AP_MODULE_DECLARE_DATA sflow_module;
 
 #define GET_CONFIG_DATA(s) ap_get_module_config((s)->module_config, &sflow_module)
@@ -1185,7 +1188,19 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     SFWBShared *shared = (SFWBShared *)sm->shared_mem_base;
     shared->http_counters.tag = SFLCOUNTERS_HTTP;
 
+    apr_proc_t *prev_sflow_master = NULL;
+    apr_pool_userdata_get((void **)&prev_sflow_master, MOD_SFLOW_USERDATA_KEY_SFLOWMASTER, s->process->pool);
+    if(prev_sflow_master) {
+#ifdef SFWB_DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - killing previous master");
+#endif
+        apr_proc_kill(prev_sflow_master, SIGKILL);
+    }
+
     sm->sFlowProc = apr_palloc(p, sizeof(apr_proc_t));
+
+    /* cache in pool for master process so we can make sure it is cleaned up even on graceful restart */
+    apr_pool_userdata_set((void*) sm->sFlowProc, MOD_SFLOW_USERDATA_KEY_SFLOWMASTER, apr_pool_cleanup_null, s->process->pool);
 
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
