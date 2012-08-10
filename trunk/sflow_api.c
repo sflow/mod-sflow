@@ -46,7 +46,7 @@ static void sflFree(SFLAgent *agent, void *obj)
 void sfl_agent_error(SFLAgent *agent, char *modName, char *msg)
 {
     char errm[MAX_ERRMSG_LEN];
-    apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_agent_error: %s: %s\n", modName, msg);
+    apr_snprintf(errm, MAX_ERRMSG_LEN, "sfl_agent_error: %s: %s", modName, msg);
     if(agent->errorFn) (*agent->errorFn)(agent->magic, agent, errm);
 }
 
