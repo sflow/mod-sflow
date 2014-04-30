@@ -106,6 +106,7 @@
 #include "apr_atomic.h"
 #include "apr_network_io.h"
 #include "apr_optional.h"
+#include "apr_signal.h"
 
 /* Apache HTTPD includes */
 #include "httpd.h"
@@ -181,6 +182,13 @@ typedef apr_uint32_t bool_t;
 module AP_MODULE_DECLARE_DATA sflow_module;
 
 #define GET_CONFIG_DATA(s) ap_get_module_config((s)->module_config, &sflow_module)
+
+/*_________________-----------------------------__________________
+  _________________ per-process (static) vars   __________________
+  -----------------_____________________________------------------
+*/
+
+static bool_t sflow_master_running;
 
 /*_________________---------------------------__________________
   _________________   optional mod_logio fn   __________________
@@ -1029,6 +1037,11 @@ static void sflow_init(SFWB *sm, server_rec *s)
   -----------------___________________________------------------
 */
 
+static void sflow_master_sigterm(int sig) {
+    /* just set the flag to cause the master thread to terminate gracefully */
+    sflow_master_running = false;
+}
+
 static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
 {
     apr_status_t rc;
@@ -1043,9 +1056,16 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_file_pipe_timeout_set() failed");
         return rc;
     }
+    
+    /* register the SIGTERM handler to provide a way of stopping this process gracefully
+     * although often it will exit before we get around to killing it, when read on the pipe fails.
+     */
+    apr_signal(SIGTERM, sflow_master_sigterm);
 
-    /* now loop forever - unless we encounter some kind of error */
-    for(;;) {
+    sflow_master_running = true;
+
+    /* now loop forever - unless we encounter some kind of error or signal */
+    while(sflow_master_running) {
 
         /* send ticks */
         /* segfaults here if mod_sflow.so is overwritten.  Need to remove it first,  then copy in the
@@ -1068,7 +1088,7 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
         apr_size_t hdrBytesRead = 0;
         rc = apr_file_read_full(sm->pipe_read, msg, hdrBytes, &hdrBytesRead);
         if(rc != APR_SUCCESS && !(APR_STATUS_IS_TIMEUP(rc))) {
-            ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
+            ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "run_sflow_master - apr_file_read_full() failed");
             pipe_err = true;
             break;
         }
@@ -1093,7 +1113,7 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             apr_size_t bodyBytes = msgBytes - hdrBytes;
             apr_size_t bodyBytesRead = 0;
             if((rc = apr_file_read_full(sm->pipe_read, msg, bodyBytes, &bodyBytesRead)) != APR_SUCCESS) {
-                ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_() file_read_full() failed");
+                ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "run_sflow_master: apr_file_read_full() failed");
                 pipe_err = true;
                 break;
             }
@@ -1138,10 +1158,17 @@ static apr_status_t run_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm)
             }
         }
     }
+
+#ifdef SFWB_DEBUG
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "run_sflow_master (pid=%u) loop exit: sflow_master_running=%s, pipe_err=%d",
+                 getpid(),
+                 sflow_master_running ? "true" : "false",
+                 pipe_err);
+#endif
     
     /* The pipe errors are what we actually expect to see if apache is restarted with SIGHUP or graceful(SIGUSR1), so only
        log an error if we see something else */
-    if(!pipe_err) {
+    if(!pipe_err && sflow_master_running) {
         /* We should only get here if there was an unexpected message error that caused us to break out of the loop above */    
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "run_sflow_master - unexpected message error");
     }
@@ -1189,18 +1216,36 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
     shared->http_counters.tag = SFLCOUNTERS_HTTP;
 
     apr_proc_t *prev_sflow_master = NULL;
-    apr_pool_userdata_get((void **)&prev_sflow_master, MOD_SFLOW_USERDATA_KEY_SFLOWMASTER, s->process->pool);
-    if(prev_sflow_master) {
+    if(apr_pool_userdata_get((void **)&prev_sflow_master, MOD_SFLOW_USERDATA_KEY_SFLOWMASTER, s->process->pool) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_userdata_get(): failed to read previous sflow master pid");
+    }
+    else if(prev_sflow_master == NULL) {
 #ifdef SFWB_DEBUG
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - killing previous master");
+        /* this is expected the first time through, so only log it when we are debugging */
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, s, "apr_userdata_get(): previous sflow master NULL");
 #endif
-        apr_proc_kill(prev_sflow_master, SIGKILL);
+    }
+    else if((int)prev_sflow_master->pid < 0) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_userdata_get(): previous sflow master PID = %d", (int)prev_sflow_master->pid);
+    }
+    else {
+#ifdef SFWB_DEBUG
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - killing previous master (PID=%d)", (int)prev_sflow_master->pid);
+#endif
+        /* apr_proc_kill(prev_sflow_master, SIGKILL); */
+        if(apr_proc_kill(prev_sflow_master, SIGTERM) != APR_SUCCESS) {
+            /* It may have exited already */
+            ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_kill(): failed to kill previous sflow master");
+        }
     }
 
-    sm->sFlowProc = apr_palloc(p, sizeof(apr_proc_t));
+    /* make sure we use the more persitant pool to allocate and store this */
+    sm->sFlowProc = apr_palloc(s->process->pool, sizeof(apr_proc_t));
 
     /* cache in pool for master process so we can make sure it is cleaned up even on graceful restart */
-    apr_pool_userdata_set((void*) sm->sFlowProc, MOD_SFLOW_USERDATA_KEY_SFLOWMASTER, apr_pool_cleanup_null, s->process->pool);
+    if(apr_pool_userdata_set((void*) sm->sFlowProc, MOD_SFLOW_USERDATA_KEY_SFLOWMASTER, apr_pool_cleanup_null, s->process->pool) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_userdata_set(): failed to store sflow master pid");
+    }
 
 #ifdef SFWB_DEBUG
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - pid=%u,tid=%u,scoreboard=%s", getpid(),MYGETTID,ap_exists_scoreboard_image() ? "YES":"NO");
@@ -1266,7 +1311,9 @@ static void *create_sflow_config(apr_pool_t *p, server_rec *s)
 
 static int sflow_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
+#ifndef SFWB_APP_WORKERS
     void *post_config_flag = NULL;
+#endif
     void *pre_mpm_flag = NULL;
 
     /* be careful in case we are not initialized yet - e.g. maybe this module was installed
