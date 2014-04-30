@@ -48,6 +48,10 @@ Installation (direct from sources)
   Note:  the first step where the module is removed is important as
   a workaround for Apache bug #47951.
 
+  For debug logging, set "LogLevel debug" in your apache httpd.conf
+  file and then compile with this extra option:
+    $ apxs -Wc,-DSFWB_DEBUG -c -i -a mod_sflow.c sflow_api.c
+
 Configuration
 =============
 
