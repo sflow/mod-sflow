@@ -146,6 +146,14 @@
 /* whether to enable even more logging/tracing */
 /* #define SFWB_DEBUG */
 
+/* whether to kill the sflow-master-process using SIGKILL
+   or SIGTERM.  Using SIGTERM seems to somehow not work
+   under particular circumstances,  so until we understand
+   fully why not...
+*/
+/* #define SFWB_KILL_MASTER_SIGNAL SIGTERM */
+#define SFWB_KILL_MASTER_SIGNAL SIGKILL
+
 #ifdef SFWB_DEBUG
 /* allow non-portable calls when debugging */
 #include <unistd.h> /* just for getpid() */
@@ -1232,8 +1240,8 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
 #ifdef SFWB_DEBUG
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "start_sflow_master() - killing previous master (PID=%d)", (int)prev_sflow_master->pid);
 #endif
-        /* apr_proc_kill(prev_sflow_master, SIGKILL); */
-        if(apr_proc_kill(prev_sflow_master, SIGTERM) != APR_SUCCESS) {
+        /* This is where we signal the master using SIGTERM or SIGKILL */
+        if(apr_proc_kill(prev_sflow_master, SFWB_KILL_MASTER_SIGNAL) != APR_SUCCESS) {
             /* It may have exited already */
             ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_kill(): failed to kill previous sflow master");
         }
