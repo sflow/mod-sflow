@@ -146,13 +146,10 @@
 /* whether to enable even more logging/tracing */
 /* #define SFWB_DEBUG */
 
-/* whether to kill the sflow-master-process using SIGKILL
-   or SIGTERM.  Using SIGTERM seems to somehow not work
-   under particular circumstances,  so until we understand
-   fully why not...
+/* whether to kill the sflow-master-process using SIGKILL  or SIGTERM.
 */
-/* #define SFWB_KILL_MASTER_SIGNAL SIGTERM */
-#define SFWB_KILL_MASTER_SIGNAL SIGKILL
+#define SFWB_KILL_MASTER_SIGNAL SIGTERM
+/* #define SFWB_KILL_MASTER_SIGNAL SIGKILL */
 
 #ifdef SFWB_DEBUG
 /* allow non-portable calls when debugging */
@@ -1242,8 +1239,7 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
 #endif
         /* This is where we signal the master using SIGTERM or SIGKILL */
         if(apr_proc_kill(prev_sflow_master, SFWB_KILL_MASTER_SIGNAL) != APR_SUCCESS) {
-            /* It may have exited already */
-            ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_kill(): failed to kill previous sflow master");
+            ap_log_error(APLOG_MARK, APLOG_ERR, rc, s, "apr_proc_kill(): failed to kill previous sflow master (may have exited already)");
         }
     }
 
@@ -1265,9 +1261,11 @@ static int start_sflow_master(apr_pool_t *p, server_rec *s, SFWB *sm) {
         apr_file_close(sm->pipe_write);
         /* and run the master */
         run_sflow_master(p, s, sm);
-        /* if anything goes wrong, we'll get here.  Just allow
-           the process to terminate.  This is likely to result
-           in pipe write errors in any child that is still running */
+        /* if anything goes wrong, or there is a restart we'll get here.
+         * Just exit to terminate the process.  This is likely to result
+         * in pipe write errors in any child that is still running.
+         */
+        exit(0);
         break;
     case APR_INPARENT:
         /* close the read end of the pipe */
