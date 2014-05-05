@@ -1,6 +1,6 @@
 Summary: Apache module to implement logging using sFlow
 Name: mod-sflow
-Version: 1.0.3
+Version: 1.0.5
 Release: 1%{?dist}
 License: http://www.inmon.com/technology/sflowlicense.txt
 Group: System Environment/Daemons
